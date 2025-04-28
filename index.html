@@ -16,6 +16,42 @@
             padding: 0;
             box-sizing: border-box;
         }
+		
+        /* 添加的样式 */
+        .blessings {
+            margin: 30px auto;
+            text-align: center;
+            max-width: 600px;
+        }
+
+        .blessing-row {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 10px;
+        }
+
+        .blessing-item {
+            margin: 0 15px;
+            text-align: center;
+        }
+
+        .blessing-char {
+            font-size: 60px;
+            font-weight: bold;
+            font-family: "SimSun", "宋体", serif;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+            transition: transform 0.3s;
+        }
+
+        .blessing-char:hover {
+            transform: scale(1.1);
+        }
+
+        .blessing-pinyin {
+            font-size: 16px;
+            color: #7f8c8d;
+            font-style: italic;
+        }
         
         body {
             font-family: 'Montserrat', sans-serif;
@@ -74,8 +110,8 @@
             background: rgba(255, 255, 255, 0.2);
             border: 2px solid #fff;
             color: #fff;
-            padding: 15px 30px;
-            font-size: 1.2rem;
+            padding: 20px 40px;
+            font-size: 1.8rem;
             border-radius: 50px;
             cursor: pointer;
             transition: all 0.3s ease;
@@ -325,36 +361,46 @@
         </div>
         
         <h1 id="love-text">
-            <span class="animate__animated animate__fadeInDown">I</span>
-            <span class="animate__animated animate__fadeInDown animate__delay-1s">Love</span>
-            <span class="animate__animated animate__fadeInDown animate__delay-2s">You</span>
+            <span class="animate__animated animate__fadeInDown">白利东</span>
+            <span class="animate__animated animate__fadeInDown animate__delay-1s">❤️</span>
+            <span class="animate__animated animate__fadeInDown animate__delay-2s">刘斯菲</span>
         </h1>
         
         <p class="subtitle animate__animated animate__fadeIn animate__delay-3s">
-            Forever and always, through every moment of our lives together.
+            Forever and always, through every moment of your lives together.
         </p>
         
-        <div class="countdown animate__animated animate__fadeIn animate__delay-4s">
-            <div class="countdown-item">
-                <div class="countdown-number" id="days">00</div>
-                <div class="countdown-label">Days</div>
+        <!-- 百年好合祝福部分 -->
+        <div class="blessings animate__animated animate__fadeIn animate__delay-4s">
+            <div class="blessing-row">
+                <div class="blessing-item">
+                    <div class="blessing-char" style="color: #e74c3c;">百</div>
+                </div>
+                <div class="blessing-item">
+                    <div class="blessing-char" style="color: #e67e22;">年</div>
+                </div>
+                <div class="blessing-item">
+                    <div class="blessing-char" style="color: #f1c40f;">好</div>
+                </div>
+                <div class="blessing-item">
+                    <div class="blessing-char" style="color: #2ecc71;">合</div>
+                </div>
             </div>
-            <div class="countdown-item">
-                <div class="countdown-number" id="hours">00</div>
-                <div class="countdown-label">Hours</div>
-            </div>
-            <div class="countdown-item">
-                <div class="countdown-number" id="minutes">00</div>
-                <div class="countdown-label">Minutes</div>
-            </div>
-            <div class="countdown-item">
-                <div class="countdown-number" id="seconds">00</div>
-                <div class="countdown-label">Seconds</div>
+            <div class="blessing-row">
+                <div class="blessing-item">
+                    <div class="blessing-pinyin">2025</div>
+                </div>
+                <div class="blessing-item">
+                    <div class="blessing-pinyin">05</div>
+                </div>
+                <div class="blessing-item">
+                    <div class="blessing-pinyin">02</div>
+                </div>
             </div>
         </div>
         
         <button class="heart-btn animate__animated animate__fadeInUp animate__delay-5s" id="heart-btn">
-            <i class="fas fa-heart"></i> Click for Love
+            <i class="fas fa-heart"></i> 新婚快乐
         </button>
     </div>
 
@@ -498,7 +544,55 @@
 			});
 		}
 
-		// 初始化
+		// 将爱心散开效果提取为单独函数，方便复用
+		function createHeartExplosion(event) {
+			// 创建爆炸爱心效果
+			for (let i = 0; i < 30; i++) {
+				const heart = document.createElement('div');
+				heart.innerHTML = '<i class="fas fa-heart"></i>';
+				heart.style.position = 'fixed';
+				heart.style.left = (event.clientX - 10) + 'px';
+				heart.style.top = (event.clientY - 10) + 'px';
+				heart.style.color = `hsl(${Math.random() * 60 + 330}, 100%, 70%)`;
+				heart.style.fontSize = '20px';
+				heart.style.pointerEvents = 'none';
+				heart.style.zIndex = '9999';
+				document.body.appendChild(heart);
+				
+				// 使用GSAP动画
+				gsap.to(heart, {
+					x: (Math.random() - 0.5) * 200,
+					y: (Math.random() - 0.5) * 200,
+					opacity: 0,
+					scale: Math.random() * 2 + 1,
+					duration: 1,
+					ease: 'power2.out',
+					onComplete: () => heart.remove()
+				});
+			}
+		}
+
+		// 修改后的点击按钮效果函数
+		function setupHeartButton() {
+			const heartBtn = document.getElementById('heart-btn');
+			if (heartBtn) {
+				heartBtn.addEventListener('click', function(event) {
+					createHeartExplosion(event);
+					
+					// 文字跳动效果
+					gsap.to("#love-text span", {
+						y: -20,
+						duration: 0.3,
+						stagger: 0.1,
+						ease: "power2.out",
+						yoyo: true,
+						repeat: 1
+					});
+				});
+			}
+		}
+
+		// 修改初始化函数中的按钮事件
 		window.addEventListener('DOMContentLoaded', () => {
 			createHearts();
 			
@@ -513,7 +607,6 @@
 					}
 				});
 				
-				// 只允许数字输入
 				input.addEventListener('keydown', function(e) {
 					if (isNaN(parseInt(e.key)) && e.key !== 'Backspace' && e.key !== 'Delete' && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') {
 						e.preventDefault();
@@ -521,8 +614,23 @@
 				});
 			});
 			
-			// 提交按钮事件
-			document.getElementById('submit-btn').addEventListener('click', function() {
+			// 为所有按钮添加爱心效果
+			function addHeartEffectToButton(buttonId) {
+				const button = document.getElementById(buttonId);
+				if (button) {
+					button.addEventListener('click', function(event) {
+						createHeartExplosion(event);
+					});
+				}
+			}
+			
+			// 为三个按钮添加效果
+			addHeartEffectToButton('submit-btn');
+			addHeartEffectToButton('reset-btn');
+			addHeartEffectToButton('heart-btn');
+			
+			// 修改提交按钮事件
+			document.getElementById('submit-btn').addEventListener('click', function(event) {
 				if (validateCodes()) {
 					// 全部正确，显示主内容
 					document.getElementById('unlock-screen').classList.add('hidden');
@@ -532,7 +640,6 @@
 					updateCountdown();
 					floatText();
 					setInterval(updateCountdown, 1000);
-					setupHeartButton(); // 现在设置爱心按钮事件
 					
 					// 添加入场动画
 					gsap.from("#main-content", {
@@ -551,7 +658,7 @@
 				}
 			});
 			
-			// 重置按钮事件
+			// 重置按钮事件保持不变
 			document.getElementById('reset-btn').addEventListener('click', resetInputs);
 		});
     </script>
