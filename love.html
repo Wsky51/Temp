@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Love Unlock</title>
+    <!-- 引入Google字体 -->
+    <link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@700&family=Montserrat:wght@300;400;600&display=swap" rel="stylesheet">
+    <!-- 引入Animate.css动画库 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    <!-- 引入Font Awesome图标 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Montserrat', sans-serif;
+            background: linear-gradient(-45deg, #ff9a9e, #fad0c4, #fbc2eb, #a6c1ee);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
+            height: 100vh;
+            color: #fff;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        
+        @keyframes gradient {
+            0% {
+                background-position: 0% 50%;
+            }
+            50% {
+                background-position: 100% 50%;
+            }
+            100% {
+                background-position: 0% 50%;
+            }
+        }
+        
+        .container {
+            max-width: 1200px;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        h1 {
+            font-family: 'Dancing Script', cursive;
+            font-size: 6rem;
+            margin-bottom: 2rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+            position: relative;
+        }
+        
+        h1 span {
+            display: inline-block;
+        }
+        
+        .subtitle {
+            font-size: 1.5rem;
+            margin-bottom: 3rem;
+            font-weight: 300;
+            opacity: 0.9;
+        }
+        
+        .heart-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid #fff;
+            color: #fff;
+            padding: 15px 30px;
+            font-size: 1.2rem;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+            margin-top: 20px;
+        }
+        
+        .heart-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-3px);
+        }
+        
+        .floating-hearts {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+        
+        .heart {
+            position: absolute;
+            opacity: 0;
+            animation: float 6s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0% {
+                transform: translateY(0) rotate(0deg);
+                opacity: 0;
+            }
+            10% {
+                opacity: 1;
+            }
+            90% {
+                opacity: 1;
+            }
+            100% {
+                transform: translateY(-100vh) rotate(360deg);
+                opacity: 0;
+            }
+        }
+        
+        .photo-frame {
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            border: 5px solid white;
+            margin: 0 auto 30px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            transition: all 0.3s ease;
+        }
+        
+        .photo-frame:hover {
+            transform: scale(1.05);
+        }
+        
+        .photo-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .countdown {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 30px;
+        }
+        
+        .countdown-item {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 15px 20px;
+            border-radius: 10px;
+            backdrop-filter: blur(5px);
+            min-width: 80px;
+        }
+        
+        .countdown-number {
+            font-size: 2rem;
+            font-weight: 600;
+        }
+        
+        .countdown-label {
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
+        
+        /* 解锁界面样式 */
+        .unlock-container {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 40px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            max-width: 500px;
+            width: 90%;
+            text-align: center;
+        }
+        
+        .unlock-title {
+            font-size: 2rem;
+            margin-bottom: 30px;
+            font-weight: 600;
+            color: #fff;
+        }
+        
+        .code-inputs {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .code-input {
+            width: 70px;
+            height: 70px;
+            font-size: 2rem;
+            text-align: center;
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            border-radius: 10px;
+            transition: all 0.3s ease;
+        }
+        
+        .code-input:focus {
+            outline: none;
+            border-color: #fff;
+            background: rgba(255, 255, 255, 0.2);
+            transform: scale(1.05);
+        }
+        
+        .code-input.correct {
+            border-color: #6bff6b;
+            background: rgba(107, 255, 107, 0.1);
+        }
+        
+        .code-input.incorrect {
+            border-color: #ff6b6b;
+            background: rgba(255, 107, 107, 0.1);
+            animation: shake 0.5s;
+        }
+        
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            20%, 60% { transform: translateX(-5px); }
+            40%, 80% { transform: translateX(5px); }
+        }
+        
+        .button-group {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+        }
+        
+        .unlock-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid #fff;
+            color: #fff;
+            padding: 12px 25px;
+            font-size: 1rem;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .unlock-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-3px);
+        }
+        
+        .unlock-btn.reset {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .hint {
+            margin-top: 20px;
+            font-size: 0.9rem;
+            opacity: 0.7;
+            font-style: italic;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+        
+        @media (max-width: 768px) {
+            .unlock-container {
+                padding: 30px 20px;
+            }
+            
+            .code-input {
+                width: 50px;
+                height: 50px;
+                font-size: 1.5rem;
+            }
+            
+            h1 {
+                font-size: 4rem;
+            }
+            
+            .subtitle {
+                font-size: 1.2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="floating-hearts" id="hearts-container"></div>
+    
+    <!-- 解锁界面 -->
+    <div class="unlock-container animate__animated animate__fadeIn" id="unlock-screen">
+        <h2 class="unlock-title">Enter the Code of Love</h2>
+        <p>Input the ASCII codes for L-O-V-E</p>
+        
+        <div class="code-inputs">
+            <input type="text" maxlength="3" class="code-input" id="code-l" placeholder="L">
+            <input type="text" maxlength="3" class="code-input" id="code-o" placeholder="O">
+            <input type="text" maxlength="3" class="code-input" id="code-v" placeholder="V">
+            <input type="text" maxlength="3" class="code-input" id="code-e" placeholder="E">
+        </div>
+        
+        <div class="button-group">
+            <button class="unlock-btn reset" id="reset-btn">
+                <i class="fas fa-redo"></i> Reset
+            </button>
+            <button class="unlock-btn" id="submit-btn">
+                <i class="fas fa-lock-open"></i> Unlock Love
+            </button>
+        </div>
+        
+        <p class="hint">Hint: ASCII codes are numerical representations of characters</p>
+    </div>
+    
+    <!-- 主内容界面 (初始隐藏) -->
+    <div class="container hidden" id="main-content">
+        <div class="photo-frame">
+            <!-- 替换为你们的照片 -->
+            <img src="https://images.unsplash.com/photo-1516589178581-6cd7833ae3b2?ixlib=rb-1.2.1&auto=format&fit=crop&w=634&q=80" alt="Couple Photo">
+        </div>
+        
+        <h1 id="love-text">
+            <span class="animate__animated animate__fadeInDown">I</span>
+            <span class="animate__animated animate__fadeInDown animate__delay-1s">Love</span>
+            <span class="animate__animated animate__fadeInDown animate__delay-2s">You</span>
+        </h1>
+        
+        <p class="subtitle animate__animated animate__fadeIn animate__delay-3s">
+            Forever and always, through every moment of our lives together.
+        </p>
+        
+        <div class="countdown animate__animated animate__fadeIn animate__delay-4s">
+            <div class="countdown-item">
+                <div class="countdown-number" id="days">00</div>
+                <div class="countdown-label">Days</div>
+            </div>
+            <div class="countdown-item">
+                <div class="countdown-number" id="hours">00</div>
+                <div class="countdown-label">Hours</div>
+            </div>
+            <div class="countdown-item">
+                <div class="countdown-number" id="minutes">00</div>
+                <div class="countdown-label">Minutes</div>
+            </div>
+            <div class="countdown-item">
+                <div class="countdown-number" id="seconds">00</div>
+                <div class="countdown-label">Seconds</div>
+            </div>
+        </div>
+        
+        <button class="heart-btn animate__animated animate__fadeInUp animate__delay-5s" id="heart-btn">
+            <i class="fas fa-heart"></i> Click for Love
+        </button>
+    </div>
+
+    <!-- 引入GSAP动画库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.9.1/gsap.min.js"></script>
+    <script>
+		// ASCII码答案
+		const asciiCodes = {
+			'L': '76',
+			'O': '79',
+			'V': '86',
+			'E': '69'
+		};
+
+		// 创建浮动爱心
+		function createHearts() {
+			const container = document.getElementById('hearts-container');
+			const colors = ['#ff6b6b', '#ff8787', '#ffa3a3', '#f8c4c4', '#ffb8b8']; // 修复引号问题
+			
+			for (let i = 0; i < 20; i++) {
+				const heart = document.createElement('div');
+				heart.innerHTML = '<i class="fas fa-heart"></i>';
+				heart.classList.add('heart');
+				heart.style.left = Math.random() * 100 + 'vw';
+				heart.style.top = Math.random() * 100 + 'vh';
+				heart.style.fontSize = (Math.random() * 20 + 10) + 'px';
+				heart.style.color = colors[Math.floor(Math.random() * colors.length)];
+				heart.style.animationDelay = Math.random() * 5 + 's';
+				container.appendChild(heart);
+			}
+		}
+
+		// 倒计时功能
+		function updateCountdown() {
+			// 设置你们的结婚日期（年, 月-1, 日）
+			const weddingDate = new Date(2023, 11, 31); // 2023年12月31日
+			const now = new Date();
+			const diff = weddingDate - now;
+			
+			if (diff <= 0) {
+				document.getElementById('days').textContent = '00';
+				document.getElementById('hours').textContent = '00';
+				document.getElementById('minutes').textContent = '00';
+				document.getElementById('seconds').textContent = '00';
+				return;
+			}
+			
+			const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+			const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+			const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+			const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+			
+			document.getElementById('days').textContent = days.toString().padStart(2, '0');
+			document.getElementById('hours').textContent = hours.toString().padStart(2, '0');
+			document.getElementById('minutes').textContent = minutes.toString().padStart(2, '0');
+			document.getElementById('seconds').textContent = seconds.toString().padStart(2, '0');
+		}
+
+		// 点击按钮效果
+		function setupHeartButton() {
+			const heartBtn = document.getElementById('heart-btn');
+			if (heartBtn) {
+				heartBtn.addEventListener('click', function(event) {
+					// 创建爆炸爱心效果
+					for (let i = 0; i < 30; i++) {
+						const heart = document.createElement('div');
+						heart.innerHTML = '<i class="fas fa-heart"></i>';
+						heart.style.position = 'fixed';
+						heart.style.left = (event.clientX - 10) + 'px';
+						heart.style.top = (event.clientY - 10) + 'px';
+						heart.style.color = `hsl(${Math.random() * 60 + 330}, 100%, 70%)`;
+						heart.style.fontSize = '20px';
+						heart.style.pointerEvents = 'none';
+						heart.style.zIndex = '9999';
+						document.body.appendChild(heart);
+						
+						// 使用GSAP动画
+						gsap.to(heart, {
+							x: (Math.random() - 0.5) * 200,
+							y: (Math.random() - 0.5) * 200,
+							opacity: 0,
+							scale: Math.random() * 2 + 1,
+							duration: 1,
+							ease: 'power2.out',
+							onComplete: () => heart.remove()
+						});
+					}
+					
+					// 文字跳动效果
+					gsap.to("#love-text span", {
+						y: -20,
+						duration: 0.3,
+						stagger: 0.1,
+						ease: "power2.out",
+						yoyo: true,
+						repeat: 1
+					});
+				});
+			}
+		}
+
+		// 文字浮动效果
+		function floatText() {
+			gsap.to("#love-text span", {
+				y: 10,
+				duration: 2,
+				repeat: -1,
+				yoyo: true,
+				ease: "sine.inOut",
+				stagger: 0.2
+			});
+		}
+
+		// 验证ASCII码
+		function validateCodes() {
+			let allCorrect = true;
+			
+			for (const [letter, code] of Object.entries(asciiCodes)) {
+				const input = document.getElementById(`code-${letter.toLowerCase()}`);
+				const inputValue = input.value.trim();
+				
+				if (inputValue === code) {
+					input.classList.add('correct');
+					input.classList.remove('incorrect');
+				} else {
+					input.classList.add('incorrect');
+					input.classList.remove('correct');
+					allCorrect = false;
+				}
+			}
+			
+			return allCorrect;
+		}
+
+		// 重置输入
+		function resetInputs() {
+			['l', 'o', 'v', 'e'].forEach(letter => {
+				const input = document.getElementById(`code-${letter}`);
+				input.value = '';
+				input.classList.remove('correct', 'incorrect');
+			});
+		}
+
+		// 初始化
+		window.addEventListener('DOMContentLoaded', () => {
+			createHearts();
+			
+			// 设置输入框自动跳转
+			const inputs = document.querySelectorAll('.code-input');
+			inputs.forEach((input, index) => {
+				input.addEventListener('input', function() {
+					if (this.value.length === this.maxLength) {
+						if (index < inputs.length - 1) {
+							inputs[index + 1].focus();
+						}
+					}
+				});
+				
+				// 只允许数字输入
+				input.addEventListener('keydown', function(e) {
+					if (isNaN(parseInt(e.key)) && e.key !== 'Backspace' && e.key !== 'Delete' && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') {
+						e.preventDefault();
+					}
+				});
+			});
+			
+			// 提交按钮事件
+			document.getElementById('submit-btn').addEventListener('click', function() {
+				if (validateCodes()) {
+					// 全部正确，显示主内容
+					document.getElementById('unlock-screen').classList.add('hidden');
+					document.getElementById('main-content').classList.remove('hidden');
+					
+					// 初始化主页面
+					updateCountdown();
+					floatText();
+					setInterval(updateCountdown, 1000);
+					setupHeartButton(); // 现在设置爱心按钮事件
+					
+					// 添加入场动画
+					gsap.from("#main-content", {
+						opacity: 0,
+						y: 50,
+						duration: 1,
+						ease: "power2.out"
+					});
+				} else {
+					// 错误反馈
+					gsap.to(".unlock-container", {
+						x: [0, 10, -10, 0],
+						duration: 0.5,
+						ease: "power1.out"
+					});
+				}
+			});
+			
+			// 重置按钮事件
+			document.getElementById('reset-btn').addEventListener('click', resetInputs);
+		});
+    </script>
+</body>
+</html>
