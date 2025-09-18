@@ -181,23 +181,45 @@ type RequestVoteReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// 对于小任期的AppendEntries包直接返回
+
+	// DebugPretty(dHeart, "AppendEntries args:%v", args)
+
+	// 对于rpc任期小于当前任期的AppendEntries包直接返回, 通知领导者任期过期，促使其回退成为follwer
 	if args.Term < rf.currentTerm {
-		DebugPretty(dHeart, "S%d 收到 S%d 的AppendEntries，任期条件不满足, 领导者任期 %v < 当前节点任期:%v", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+		DebugPretty(dHeart, "S%d(%d) 收到 S%d(%d) 的ApdEty,任期条件不满足", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// 对于rpc任期大于当前任期的AppendEntries，直接转为Follow状态, 且更新自己的任期, 不用返回
+	if args.Term > rf.currentTerm{
+		rf.becomeFollwer()
+		rf.currentTerm = args.Term
+	}
+
+	// 重置超时
+	rf.resetTimeout()
+
+	// 2. 日志一致性检查，args.prevLogIndex 超出了自己日志的最后一个索引（即自己的日志太短），回复false
+	if args.PrevLogIndex > len(rf.log) -1{
+		DebugPretty(dHeart, "S%d(%d) 收到 S%d(%d) 的ApdEty, 日志log idx不匹配", rf.me, len(rf.log) -1, args.LeaderId, args.PrevLogIndex)
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// 检查prevLogIndex处是否存在日志冲突
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DebugPretty(dHeart, "S%d(%d) 收到 S%d(%d) 的ApdEty, 日志log term不匹配", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 	
-	if args.Term > rf.currentTerm {
-		rf.votedFor = -1
-	}
-
-	// 任期条件满足，重置计时器
-	rf.becomeFollwer()
-	rf.currentTerm = args.Term
 
 	reply.Term = args.Term
+	
 	// 如果是心跳包，直接返回
 	if len(args.Entries) == 0 {
 		DebugPretty(dHeart, "S%d 收到 S%d 的心跳包，返回成功", rf.me, args.LeaderId)
@@ -269,7 +291,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// 投票规则
 	//1 任期检查
-	// 如果请求中的term < 自己的当前term，拒绝投票，并直接返回
+	// 如果请求中的term < 自己的当前term，拒绝投票
 	// 如果请求中的term > 自己的当前term，更新自己的term并转为Follower
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
@@ -281,14 +303,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.becomeFollwer()
-		rf.votedFor = -1
 	}
 
 	reply.Term = args.Term
 	//2 本投票周期内没有投票给其他人，且候选人的日志更加新，则投票给他
 	is_lognewer := rf.isLogNewer(args.LastLogTerm, args.LastLogIndex)
 	if is_lognewer && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
-		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetTimeout()
 		DebugPretty(dVote, "S%d 收到 S%d 投票请求并赞成，args:%v", rf.me, args.CandidateId, args)
@@ -453,6 +473,7 @@ func (rf *Raft) becomeFollwer() {
 	rf.resetTimeout()
 	rf.state = Follower // Follwer
 	rf.voteCnt = 0
+	rf.votedFor = -1
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -465,7 +486,7 @@ func (rf *Raft) becomeCandidate() {
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader // Leader
-	rf.votedFor = rf.me
+	rf.votedFor = -1
 	rf.initNextAndMatchIndex()
 	// 成为领导人后立刻发送心跳消息给其他节点
 	rf.sendHeartBeat()
@@ -476,17 +497,18 @@ func (rf *Raft) sendHeartBeat() {
 		if i != rf.me {
 			go func(server int) {
 				rf.mu.Lock()
-				if rf.state != Leader || rf.killed(){{
+				// defer rf.mu.Unlock()
+				args, reply := rf.makeAppendEntries(server)
+				if rf.killed() {
 					rf.mu.Unlock()
 					return
-				}}
-				args, reply := rf.makeAppendEntries(server)
+				}
 				rf.mu.Unlock()
 				DebugPretty(dHeart, "S%d 向 S%d 发送心跳", rf.me, server)
 				ok := rf.sendAppendEntries(server, &args, &reply)
 
 				rf.mu.Lock()
-				if ok && !reply.Success && rf.state == Leader  {
+				if ok && !reply.Success {
 					if rf.currentTerm < reply.Term { // 任期小于follwer，回退成为follwer
 						rf.becomeFollwer()
 						DebugPretty(dLeader, "S%d 当前任期%v小于 S%d 的任期%v, 自身回退成为follwer", rf.me, rf.currentTerm, server, reply.Term)
@@ -510,41 +532,20 @@ func (rf *Raft) startElection() {
 				rf.mu.Lock()
 				lastLogEntry := rf.log[len(rf.log)-1]
 				args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: lastLogEntry.Index, LastLogTerm: lastLogEntry.Term}
-				DebugPretty(dVote, "S%d(%d) 选举超时，-> %d 请求投票，args:%v", rf.me, rf.currentTerm, server, args)
 				rf.mu.Unlock()
+
 				reply := RequestVoteReply{}
+				DebugPretty(dVote, "S%d 超时，向 %d 发送请求投票消息，args:%v", rf.me, server, args)
 				ok := rf.sendRequestVote(server, &args, &reply)
+				DebugPretty(dVote, "S%d <--- %d 投票结果反馈，args:%v, reply:%v, ok:%v", rf.me, server, args, reply, ok)
 
 				// 收集投票情况
 				rf.mu.Lock()
-				if ok {
-					// 1.如果不是候选人状态就没必要处理投票结果了
-					if rf.state != Candidate { 
-						rf.mu.Unlock()
-						return
-					}
-					// 2.如果响应中的任期号 T_response 大于候选人自己当前的任期号, 说明候选人已经过时了, 回退为跟随者，并更新自己的currentTerm
-					if reply.Term > rf.currentTerm {
-						rf.becomeFollwer()
-						rf.currentTerm = reply.Term
-						DebugPretty(dLeader, "S%d 本次选举失败,因为有更大任期,回退为Flw", rf.me)
-						rf.mu.Unlock()
-						return
-					}
-
-					//3. 如果响应中的任期号小于候选人当前的, 则直接忽略这个响应
-					if reply.Term < rf.currentTerm {
-						rf.mu.Unlock()
-						return
-					}
-
-					//4. 处理有效任期下的投票结果
-					if reply.VoteGranted {
-						rf.voteCnt++
-						if rf.voteCnt > len(rf.peers)/2 {
-							DebugPretty(dLeader, "S%d 成为领导者(%d)", rf.me, rf.currentTerm)
-							rf.becomeLeader()
-						}
+				if rf.state != Leader && reply.VoteGranted {
+					rf.voteCnt++
+					if rf.voteCnt > len(rf.peers)/2 {
+						DebugPretty(dLeader, "S%d 成为领导者", rf.me)
+						rf.becomeLeader()
 					}
 				}
 				rf.mu.Unlock()
