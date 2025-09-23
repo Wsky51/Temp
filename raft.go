@@ -189,9 +189,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 对于rpc任期大于当前任期的AppendEntries，直接转为Follow状态, 且更新自己的任期, 不用返回
 	if args.Term > rf.currentTerm{
-		rf.becomeFollwer()
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
+		rf.becomeFollwer(args.Term, true)
 	}
 
 	// 重置超时
@@ -291,6 +289,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DebugPretty(dVote, "S%d(%d) <- rpc S%d(%d) 收到投票请求", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	// 投票规则
 	//1 任期检查
 	// 如果请求中的term < 自己的当前term，拒绝投票，并直接返回
@@ -298,14 +297,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		DebugPretty(dVote, "S%d <- S%d 投票请求并拒绝，任期条件不满足, args:%v, (rpc)%v, (cur)%v", rf.me, args.CandidateId, args, args.Term, rf.currentTerm)
+		DebugPretty(dVote, "S%d(%d) <- S%d(%d) 投票请求并拒绝，任期条件不满足, args:%v, (rpc)%v, (cur)%v", rf.me, rf.currentTerm, args.CandidateId, args.Term, args, args.Term, rf.currentTerm)
 		return
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.becomeFollwer()
-		rf.votedFor = -1
+		rf.becomeFollwer(args.Term, false)
 	}
 
 	reply.Term = args.Term
@@ -318,7 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DebugPretty(dVote, "S%d <- (rpc)S%d 投票请求并赞成，args:%v", rf.me, args.CandidateId, args)
 		return
 	}
-	DebugPretty(dVote, "S%d <- S%d 投票请求并拒绝，args:%v, 日志是否更新:%v, votedFor:%v", rf.me, args.CandidateId, args, is_lognewer, rf.votedFor)
+	DebugPretty(dVote, "S%d(%d) <- S%d(%d) 投票请求并拒绝，args:%v, 日志是否更新:%v, votedFor:%v", rf.me, rf.currentTerm, args.CandidateId, args.Term, args, is_lognewer, rf.votedFor)
 	reply.VoteGranted = false
 }
 
@@ -381,9 +378,7 @@ func (rf *Raft) replicateToPeer(serverId int) {
 		// 1.  reply.Term > currentTerm，说明响应来自一个更新的任期。领导者会立即承认自己过时, 转为follower；如果 reply.Term < currentTerm，这是一个陈旧的响应，可以直接忽略
 		if reply.Term > rf.currentTerm { // 如果其他节点的任期更大，则回退成为follwer
 			DebugPretty(dLog, "S%d(%d) 任期没 S%d(%d)大，回退成为flw",rf.me, rf.currentTerm, serverId, reply.Term)
-			rf.becomeFollwer()
-			rf.votedFor = -1
-			rf.currentTerm = reply.Term
+			rf.becomeFollwer(reply.Term, true)
 			return
 		}
 
@@ -517,10 +512,14 @@ func (rf *Raft) resetTimeout() {
 	rf.electionTimeoutBeginTs = time.Now().UnixMilli()
 }
 
-func (rf *Raft) becomeFollwer() {
-	rf.resetTimeout()
+func (rf *Raft) becomeFollwer(term int, resetTimeout bool) {
+	if resetTimeout {
+		rf.resetTimeout()
+	}
 	rf.state = Follower // Follwer
 	rf.voteCnt = 0
+	rf.currentTerm = term
+	rf.votedFor = -1
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -556,9 +555,7 @@ func (rf *Raft) sendHeartBeat() {
 				rf.mu.Lock()
 				if ok && rf.state == Leader  {
 					if rf.currentTerm < reply.Term { // 任期小于follwer，回退成为follwer
-						rf.becomeFollwer()
-						rf.votedFor = -1
-						rf.currentTerm = reply.Term
+						rf.becomeFollwer(reply.Term, true)
 						DebugPretty(dLeader, "S%d 当前任期%v小于 S%d 的任期%v, 自身回退成为follwer", rf.me, rf.currentTerm, server, reply.Term)
 					}
 					if !reply.Success {
@@ -628,9 +625,7 @@ func (rf *Raft) startElection() {
 					}
 					// 2.如果响应中的任期号 T_response 大于候选人自己当前的任期号, 说明候选人已经过时了, 回退为跟随者，并更新自己的currentTerm
 					if reply.Term > rf.currentTerm {
-						rf.becomeFollwer()
-						rf.votedFor = -1
-						rf.currentTerm = reply.Term
+						rf.becomeFollwer(reply.Term, true)
 						DebugPretty(dLeader, "S%d 本次选举失败,因为有更大任期,回退为Flw", rf.me)
 						rf.mu.Unlock()
 						return
