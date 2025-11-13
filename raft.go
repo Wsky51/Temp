@@ -72,19 +72,6 @@ type Raft struct {
 	
 }
 
-func (rf *Raft) GetRoleStr() string {
-	if rf.state == Follower {
-		return "Follower"
-	}
-	if rf.state == Candidate {
-		return "Candidate"
-	}
-	if rf.state == Leader {
-		return "Leader"
-	}
-	return "None"
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -138,8 +125,10 @@ func (rf *Raft) readPersist(data []byte) {
 	}else{
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logs
-		DebugPretty(dError, "S%d decode success,term:%, votedFor:%d", rf.me, rf.currentTerm, rf.votedFor)
+		DebugPretty(dError, "S%d decode success,term:%d, votedFor:%d", rf.me, rf.currentTerm, rf.votedFor)
 	}
 }
 
@@ -155,8 +144,34 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-	DebugPretty(dSnap, "S%d snapshot idx:%d, log:%v, snapshot:%v", rf.me, rf.log, snapshot)
+	// Your code here (3D).	
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DebugPretty(dSnap, "S%d snapshot index:%d",rf.me, index)
+	
+	if (index <= rf.lastIncludedIndex){
+		DebugPretty(dSnap, "S%d idx(%d) <= preidx(%d)", rf.me, index, rf.lastIncludedIndex)
+		return
+	}
+	if (index > rf.getLastLogIdx()){
+		DebugPretty(dSnap, "S%d idx(%d) > last(%d)", rf.me, index, rf.lastIncludedIndex)
+		return
+	}
+
+	realIdx := index - rf.lastIncludedIndex
+	rf.lastIncludedTerm = rf.log[realIdx].Term
+	rf.lastIncludedIndex = index
+
+	newLog := make([]LogEntry, 0)
+	newLog = append(newLog, LogEntry{rf.lastIncludedIndex, rf.lastIncludedTerm, nil}) // 保留一个哨兵
+	rf.log = append(newLog, rf.log[realIdx + 1:]...)
+	for i := 0; i < len(rf.log); i++ {
+        DebugPretty(dSnap, "S%d i:%d, index:%d", rf.me, i , rf.log[i].Index)
+    }
+
+	DebugPretty(dSnap, "S%d snapshot index:%d, last log idx: %d, log len:%d",rf.me, index, rf.getLastLogIdx(), len(rf.log))
+	raftstate := rf.persistState()
+	rf.persister.Save(raftstate, snapshot) // 持久化存储快照
 }
 
 type AppendEntriesArgs struct {
@@ -230,24 +245,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = args.Term
 
 	// 2. 日志一致性检查，args.prevLogIndex 超出了自己日志的最后一个索引（即自己的日志太短），回复false
-	if args.PrevLogIndex > len(rf.log) -1{
+	if args.PrevLogIndex > rf.getLastLogIdx(){
 		reply.Success = false
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = rf.getLastLogIdx() + 1 
 		reply.ConflictTerm = -1
 		DebugPretty(dLog, "S%d(%d) <- S%d(%d) 的ApdEty, 日志PrevLogIndex不匹配, reply:%v", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply)
 		return
 	}
 
+	entry := rf.getLogEntry(args.PrevLogIndex)
 	// 检查prevLogIndex处是否存在日志冲突
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if entry.Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.ConflictIndex = -1
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = entry.Term
 		// 找到冲突任期的第一个索引
         index := args.PrevLogIndex
         // 向前遍历日志，找到 ConflictTerm 这个任期的第一个条目
-        for index > 0 && rf.log[index-1].Term == reply.ConflictTerm {
-            index--
+        for index > 0 && rf.getLogEntry(index-1).Term == reply.ConflictTerm {
+			index--
         }
         reply.ConflictIndex = index // 这是 ConflictTerm 这个任期开始的位置
 		DebugPretty(dHeart, "S%d(%d) <- S%d(%d) 的ApdEty, 日志PrevLogTerm不匹配, reply:%v", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply)
@@ -261,8 +277,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i, v := range args.Entries {
         idx := args.PrevLogIndex + 1 + i
 		// 跳过那些重复的日志
-		if idx <= len(rf.log) - 1 {
-			if rf.log[idx].Term != v.Term {
+		if idx <= rf.getLastLogIdx() {
+			if rf.getLogEntry(idx).Term != v.Term {
 				// 截断本地日志并追加新日志
 				rf.log = rf.log[:idx]
 				rf.log = append(rf.log, args.Entries[i:]...)
@@ -293,7 +309,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	newCommit := min(args.LeaderCommit, lastNewIndex)
 	if newCommit > rf.commitIndex {
 		rf.commitIndex = newCommit
-		DebugPretty(dCommit, "S%d(%d) commitIdx被更新到%d, 此处日志:%v", rf.me, rf.currentTerm, rf.commitIndex, rf.log[rf.commitIndex].Command)
+		DebugPretty(dCommit, "S%d(%d) commitIdx被更新到%d, 此处日志:%v", rf.me, rf.currentTerm, rf.commitIndex, rf.getLogEntry(rf.commitIndex).Command)
 	}
 	reply.Success = true
 }
@@ -391,8 +407,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) makeAppendEntries(server int) (AppendEntriesArgs, AppendEntriesReply) {
 	preLogIdx := rf.nextIndex[server] - 1
-	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: preLogIdx, PrevLogTerm: rf.log[preLogIdx].Term, Entries: make([]LogEntry, len(rf.log[preLogIdx + 1:])), LeaderCommit: rf.commitIndex}
-	copy(args.Entries, rf.log[preLogIdx + 1:])
+	DebugPretty(dLog, "S%d(%d) preLogIdx:%d,  lastIdx: %d, lastTerm: %d, rf0 idx:%d, rf -1 idx:%d", rf.me, rf.currentTerm, preLogIdx, rf.lastIncludedIndex, rf.lastIncludedTerm,rf.log[0].Index, rf.log[len(rf.log)-1].Index)
+	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: preLogIdx, PrevLogTerm: rf.log[preLogIdx - rf.lastIncludedIndex].Term, Entries: make([]LogEntry, len(rf.log[preLogIdx - rf.lastIncludedIndex + 1:])), LeaderCommit: rf.commitIndex}
+	copy(args.Entries, rf.log[preLogIdx - rf.lastIncludedIndex + 1:])
 	return args, AppendEntriesReply{}
 }
 
@@ -403,7 +420,7 @@ func (rf *Raft) replicateToPeer(serverId int) {
 		return
 	}
 	args, reply := rf.makeAppendEntries(serverId)
-	DebugPretty(dLog, "S%d(%d) -> S%d发送日志复制, from %v~%v",rf.me, rf.currentTerm, serverId, args.PrevLogIndex+1, len(rf.log)-1)
+	DebugPretty(dLog, "S%d(%d) -> S%d发送日志复制, from %v~%v",rf.me, rf.currentTerm, serverId, args.PrevLogIndex+1, rf.getLastLogIdx())
 	rf.mu.Unlock()
 	
 	ok := rf.sendAppendEntries(serverId, &args, &reply)
@@ -458,7 +475,7 @@ func (rf *Raft) replicateToPeer(serverId int) {
 				// 情况2: 任期冲突
 				conflictTermIndex := -1
 				for i := args.PrevLogIndex; i > 0; i-- {
-					if rf.log[i].Term == reply.ConflictTerm {
+					if rf.getLogEntry(i).Term == reply.ConflictTerm {
 						conflictTermIndex = i
 						break
 					}
@@ -496,6 +513,28 @@ func (rf *Raft) replicateToAllPeers() {
 	}
 }
 
+// 根据日志索引获取日志
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	if index <= rf.lastIncludedIndex {
+        return LogEntry{}
+    }
+	relativeIndex := index - rf.lastIncludedIndex
+	if relativeIndex < 0 || relativeIndex >= len(rf.log) {
+        return LogEntry{}
+    }
+    return rf.log[relativeIndex]
+}
+
+// 获取最后一个日志的Index
+func (rf *Raft) getLastLogIdx() int {
+	return max(rf.log[len(rf.log)-1].Index, rf.lastIncludedIndex)
+}
+
+// 获取最后一个日志的Term
+func (rf *Raft) getLastLogTerm() int {
+	return max(rf.log[len(rf.log)-1].Term, rf.lastIncludedTerm)
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -517,7 +556,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false // 不是leader的话直接返回
 	}
 	
-	logEntry := LogEntry{Index: len(rf.log), Term: term, Command: command}
+	logEntry := LogEntry{Index: rf.getLastLogIdx() + 1, Term: term, Command: command}
 	DebugPretty(dLog, "S%d(%d) 收到了一条日志: %v(%v)", rf.me, rf.currentTerm, logEntry.Index ,command)
 	rf.log = append(rf.log, logEntry)
 	rf.persist()
@@ -593,6 +632,7 @@ func (rf *Raft) sendHeartBeat() {
 				ok := rf.sendAppendEntries(server, &args, &reply)
 
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if ok && rf.state == Leader  {
 					if rf.currentTerm < reply.Term { // 任期小于follwer，回退成为follwer
 						rf.becomeFollwer(reply.Term, true)
@@ -611,7 +651,7 @@ func (rf *Raft) sendHeartBeat() {
 							// 情况2: 任期冲突
 							conflictTermIndex := -1
 							for i := args.PrevLogIndex; i > 0; i-- {
-								if rf.log[i].Term == reply.ConflictTerm {
+								if rf.getLogEntry(i).Term == reply.ConflictTerm {
 									conflictTermIndex = i
 									break
 								}
@@ -635,7 +675,6 @@ func (rf *Raft) sendHeartBeat() {
 						DebugPretty(dLog, "S%d(%d) 发送心跳到%d 日志不匹配, 回退nextIdx=%d",rf.me, rf.currentTerm, server, rf.nextIndex[server])
 					}
 				}
-				rf.mu.Unlock()
 			}(i)
 		}
 	}
@@ -698,9 +737,11 @@ func (rf *Raft) applyMsg() {
 		if !rf.killed() {
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
-				msg := raftapi.ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
-				DebugPretty(dCommit, "S%d 提交日志%v(%d)到通道", rf.me, rf.log[rf.lastApplied].Command, rf.lastApplied)
+				msg := raftapi.ApplyMsg{CommandValid: true, Command: rf.getLogEntry(rf.lastApplied).Command, CommandIndex: rf.lastApplied}
+				DebugPretty(dCommit, "S%d 提交日志%v(%d)到通道", rf.me, rf.getLogEntry(rf.lastApplied).Command, rf.lastApplied)
+				rf.mu.Unlock()
 				rf.applyCh <- msg
+				rf.mu.Lock()
 			}
 		}
 		rf.mu.Unlock()
@@ -740,7 +781,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) initNextAndMatchIndex() {
 	rf.nextIndex = make([]int, len(rf.peers)) // 初始化最后一个日志的index + 1
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log) // 初始化都是1
+		rf.nextIndex[i] = rf.getLastLogIdx() + 1 // 初始化都是1
 	}
 
 	rf.matchIndex = make([]int, len(rf.peers)) // 初始化为0
