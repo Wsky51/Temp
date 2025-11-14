@@ -104,7 +104,7 @@ func (rf *Raft) persistState() []byte {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	raftstate := rf.persistState()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -149,6 +149,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	DebugPretty(dSnap, "S%d snapshot index:%d",rf.me, index)
 	
+	// 1. 边界检查
 	if (index <= rf.lastIncludedIndex){
 		DebugPretty(dSnap, "S%d idx(%d) <= preidx(%d)", rf.me, index, rf.lastIncludedIndex)
 		return
@@ -158,17 +159,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
+	// 2. 获取lastIncludedTerm和lastIncludedIndex
 	realIdx := index - rf.lastIncludedIndex
 	rf.lastIncludedTerm = rf.log[realIdx].Term
 	rf.lastIncludedIndex = index
 
-	newLog := make([]LogEntry, 0)
-	newLog = append(newLog, LogEntry{rf.lastIncludedIndex, rf.lastIncludedTerm, nil}) // 保留一个哨兵
+	// 3. 丢弃旧日志
+	newLog := append([]LogEntry{}, LogEntry{rf.lastIncludedIndex, rf.lastIncludedTerm, nil}) // 保留一个哨兵
 	rf.log = append(newLog, rf.log[realIdx + 1:]...)
 	for i := 0; i < len(rf.log); i++ {
         DebugPretty(dSnap, "S%d i:%d, index:%d", rf.me, i , rf.log[i].Index)
     }
 
+	// 4. 持久化
 	DebugPretty(dSnap, "S%d snapshot index:%d, last log idx: %d, log len:%d",rf.me, index, rf.getLastLogIdx(), len(rf.log))
 	raftstate := rf.persistState()
 	rf.persister.Save(raftstate, snapshot) // 持久化存储快照
@@ -222,6 +225,11 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -266,7 +274,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			index--
         }
         reply.ConflictIndex = index // 这是 ConflictTerm 这个任期开始的位置
-		DebugPretty(dHeart, "S%d(%d) <- S%d(%d) 的ApdEty, 日志PrevLogTerm不匹配, reply:%v", rf.me, rf.currentTerm, args.LeaderId, args.Term, reply)
+		DebugPretty(dHeart, "S%d(%d) <- S%d(%d), 日志PrevLogTerm不匹配详情, entry:%v, args:%v", rf.me, rf.currentTerm, args.LeaderId, args.Term, entry, args)
 		return
 	}
 	if len(args.Entries) == 0 {
@@ -280,7 +288,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if idx <= rf.getLastLogIdx() {
 			if rf.getLogEntry(idx).Term != v.Term {
 				// 截断本地日志并追加新日志
-				rf.log = rf.log[:idx]
+				rf.log = rf.log[:idx - rf.lastIncludedIndex]
 				rf.log = append(rf.log, args.Entries[i:]...)
 				rf.persist()
 				break
@@ -297,14 +305,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	
 	// 4. 更新 commitIndex 与应用（apply）
-	// if args.LeaderCommit > rf.commitIndex {
-	// 	newCommitIndex := min(args.LeaderCommit, len(rf.log) - 1)
-	// 	if newCommitIndex > rf.commitIndex {
-	// 		rf.commitIndex = newCommitIndex
-	// 		DebugPretty(dCommit, "S%d(%d) commitIdx被更新到%d, 此处日志:%v", rf.me, rf.currentTerm, rf.commitIndex, rf.log[rf.commitIndex].Command)
-	// 	}
-	// }
-
 	lastNewIndex := args.PrevLogIndex + len(args.Entries)
 	newCommit := min(args.LeaderCommit, lastNewIndex)
 	if newCommit > rf.commitIndex {
@@ -314,9 +314,47 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	DebugPretty(dSnap, "S%d -> S%d send InstallSnapshot %v", rf.me, server, args)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DebugPretty(dSnap, "S%d <- S%d recv InstallSnapshot %v", rf.me, args.LeaderId, args)
+
+	// 1. 如果 args.term < currentTerm：立即回复一个包含 currentTerm 的响应，拒绝这次快照安装。这表示发送方可能是一个过期的 Leader，自己拥有了更新的任期。
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		DebugPretty(dSnap, "S%d(%d) <- S%d(%d) snapshot 任期不满足", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+		return
+	}
+
+	rf.becomeFollwer(args.Term, true)
+	reply.Term = rf.currentTerm
+
+	// 3. 快照有效性校验
+	// 3.1 如果领导者快照比自身还小，那没必要更新快照
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		DebugPretty(dSnap, "S%d(%d) <- S%d(%d) snapshot idx不满足: %d <= %d", rf.me, rf.currentTerm, args.LeaderId, args.Term, args.LastIncludedIndex, rf.lastIncludedIndex)
+		return
+	}
+
+	// 3.2 删除快照前面的日志，同步快照
+	newLog := append([]LogEntry{}, LogEntry{args.LastIncludedIndex, args.LastIncludedTerm, nil}) // 保留一个哨兵
+	if rf.getLastLogIdx() > args.LastIncludedIndex {
+		rf.log = append(newLog, rf.log[args.LastIncludedIndex - rf.lastIncludedIndex + 1:]...)
+	}else{
+		rf.log = newLog
+	}
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.commitIndex = rf.lastIncludedIndex
+	raftstate := rf.persistState()
+	rf.persister.Save(raftstate, args.Data)
+	DebugPretty(dSnap, "S%d <- S%d recv InstallSnapshot 同步完成， last idx:%d, last term:%d, rf[0].idx:%d, rf[0].term:%d", rf.me, args.LeaderId, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.log[0].Index, rf.log[0].Term)
 }
 
 // 检查日志是否至少和自己一样新, 如果新来的日志比当前节点的日志更新，则返回true
@@ -355,7 +393,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.becomeFollwer(args.Term, false)
+		/**
+		* 此处不更新自己计时器的原因是啥？
+		* 试想下有如下场景：有3个节点的集群，节点1,2,3
+		* 某一时刻，节点1发送请求投票给2,3，节点2过了一会也发投票请求给1,3。此时节点3把票投给1，但这个时候1超时了，1重新发起投票；而3收到2的投票请求此时会被重置计时器。
+		* 在这种情况下1,2都不能当选，此时1,2的term自增1，1,2各自发起投票，重复上面的操作，导致
+		*/
+		rf.becomeFollwer(args.Term, false) 
 	}
 
 	reply.Term = args.Term
@@ -419,6 +463,37 @@ func (rf *Raft) replicateToPeer(serverId int) {
 		rf.mu.Unlock()
 		return
 	}
+
+	// 场景1：待发送的Index已经被持久化到snapshot中了，则直接发送快照
+	if rf.nextIndex[serverId] <= rf.lastIncludedIndex { 
+		args := InstallSnapshotArgs{
+			Term : rf.currentTerm,
+			LeaderId : rf.me,
+			LastIncludedIndex : rf.lastIncludedIndex,
+			LastIncludedTerm : rf.lastIncludedTerm,
+			Offset : 0,
+			Data : rf.persister.ReadSnapshot(),
+			Done : true,
+		}
+		reply := InstallSnapshotReply{}
+		rf.mu.Unlock()
+		ok := rf.sendInstallSnapshot(serverId, &args, &reply)
+
+		rf.mu.Lock()
+		if ok  {
+			if reply.Term > rf.currentTerm {
+				DebugPretty(dLog, "S%d(%d) snapshot时任期没 S%d(%d)大，回退成为flw",rf.me, rf.currentTerm, serverId, reply.Term)
+				rf.becomeFollwer(reply.Term, true)
+			}else{
+				rf.nextIndex[serverId] = max(rf.lastIncludedIndex + 1, rf.nextIndex[serverId])
+				rf.matchIndex[serverId] = rf.nextIndex[serverId] - 1
+			}
+		}
+		rf.mu.Unlock()
+		return
+	}
+
+	// 场景2：非snapshot场景
 	args, reply := rf.makeAppendEntries(serverId)
 	DebugPretty(dLog, "S%d(%d) -> S%d发送日志复制, from %v~%v",rf.me, rf.currentTerm, serverId, args.PrevLogIndex+1, rf.getLastLogIdx())
 	rf.mu.Unlock()
@@ -447,8 +522,8 @@ func (rf *Raft) replicateToPeer(serverId int) {
 			DebugPretty(dLog, "S%d(%d) 已经将日志%v成功复制到%d, rf.nextIdx=%d", rf.me, rf.currentTerm, args, serverId, rf.nextIndex[serverId])
 
 			// 2.2 领导者只能提交当前任期的日志条目，并且是那些已经被大多数节点复制了的条目
-			for j := len(rf.log) - 1; j > rf.commitIndex; j-- {
-				if rf.log[j].Term != rf.currentTerm { // 只能提交本周期内的日志
+			for j := rf.getLastLogIdx(); j > rf.commitIndex; j-- {
+				if rf.getLogEntry(j).Term != rf.currentTerm { // 只能提交本周期内的日志
 					continue
 				}
 				count := 1
@@ -515,11 +590,9 @@ func (rf *Raft) replicateToAllPeers() {
 
 // 根据日志索引获取日志
 func (rf *Raft) getLogEntry(index int) LogEntry {
-	if index <= rf.lastIncludedIndex {
-        return LogEntry{}
-    }
 	relativeIndex := index - rf.lastIncludedIndex
 	if relativeIndex < 0 || relativeIndex >= len(rf.log) {
+		DebugPretty(dWarn, "S%d will return a null entry, idx: %d, last idx:%d", rf.me, index, rf.lastIncludedIndex)
         return LogEntry{}
     }
     return rf.log[relativeIndex]
@@ -617,6 +690,7 @@ func (rf *Raft) becomeLeader() {
 	rf.persist()
 }
 
+// 该方法现在不用了，用replicateToPeer方法取代
 func (rf *Raft) sendHeartBeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -735,6 +809,19 @@ func (rf *Raft) applyMsg() {
 	for {
 		rf.mu.Lock()
 		if !rf.killed() {
+			if rf.lastApplied < rf.lastIncludedIndex  {
+				msg := raftapi.ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:rf.persister.ReadSnapshot(),
+					SnapshotTerm: rf.lastIncludedTerm,
+					SnapshotIndex: rf.lastIncludedIndex,
+				}
+				rf.lastApplied = rf.lastIncludedIndex
+				DebugPretty(dCommit, "S%d 提交snapshot到通道，idx: %d", rf.me, rf.lastIncludedIndex)
+				rf.mu.Unlock()
+				rf.applyCh <- msg
+				continue
+			}
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
 				msg := raftapi.ApplyMsg{CommandValid: true, Command: rf.getLogEntry(rf.lastApplied).Command, CommandIndex: rf.lastApplied}
