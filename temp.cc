@@ -123,4 +123,116 @@ inline bool BuildMinimalFDSFromType(
 
 
 
+#!/usr/bin/env python3
+# 用依赖优先（post-order）方式构造 FileDescriptorSet，再写入 record。
+from google.protobuf.descriptor_pb2 import FileDescriptorProto, FileDescriptorSet
+from google.protobuf import descriptor_pool
 
+from cyber.python.cyber_py3 import record
+from cyber.proto.simple_pb2 import SimpleMessage
+from cyber.proto.unit_test_pb2 import Chatter
+from modules.msg.state_machine_msgs.top_state_pb2 import TopState
+from modules.msg.basic_msgs.error_code_pb2 import StatusPb
+from modules.msg.basic_msgs.header_pb2 import Header
+
+def build_file_descriptor_set(fd):
+    """
+    构建包含 fd 及其所有传递依赖的 FileDescriptorSet，
+    并保证 FileDescriptorProto 的顺序是：依赖先加入（post-order）。
+    接受 FileDescriptor 或文件名字符串，返回序列化后的 bytes。
+    """
+    pool = descriptor_pool.Default()
+    fset = FileDescriptorSet()
+    seen = set()
+    added = set()
+    # 使用名字作为唯一 key
+    def collect_names(name):
+        """收集所有依赖的文件名（递归），返回按依赖优先的列表（不重复）。"""
+        if name in seen:
+            return
+        seen.add(name)
+        try:
+            fd_obj = pool.FindFileByName(name)
+        except Exception as e:
+            print(f"Warning: cannot find file descriptor by name '{name}': {e}")
+            return
+        # 先递归依赖
+        proto_tmp = FileDescriptorProto()
+        fd_obj.CopyToProto(proto_tmp)
+        for dep in proto_tmp.dependency:
+            collect_names(dep)
+        # 然后把当前文件名加入结果（post-order）
+        if proto_tmp.name not in added:
+            added.add(proto_tmp.name)
+            fset.file.append(proto_tmp)
+
+    if hasattr(fd, 'name'):
+        start_name = fd.name
+    else:
+        start_name = fd
+    collect_names(start_name)
+    return fset.SerializeToString()
+
+def debug_print_descriptor_names(desc_bytes):
+    from google.protobuf.descriptor_pb2 import FileDescriptorSet
+    f = FileDescriptorSet()
+    f.ParseFromString(desc_bytes)
+    print("DescriptorSet contains files in this order:")
+    for pf in f.file:
+        print(" -", pf.name)
+
+def write_record(path):
+    fwriter = record.RecordWriter()
+    fwriter.set_size_fileseg(0)
+    fwriter.set_intervaltime_fileseg(0)
+    if not fwriter.open(path):
+        print('Failed to open record writer!')
+        return
+
+    # TopState (重点)
+    msg6 = TopState()
+    msg6.system_state = 0
+    msg6.state = 2
+    fd6 = msg6.DESCRIPTOR.file
+    desc_bytes6 = build_file_descriptor_set(fd6)
+    print("topstate type:", msg6.DESCRIPTOR.full_name)
+    debug_print_descriptor_names(desc_bytes6)
+    fwriter.write_channel('/state_machine/top_state/state', msg6.DESCRIPTOR.full_name, desc_bytes6)
+    fwriter.write_message('/state_machine/top_state/state', msg6.SerializeToString(), 994)
+
+    # 其余示例通道（可选）
+    # Error code
+    msg4 = StatusPb()
+    msg4.msg = "hello wuti"
+    fd4 = msg4.DESCRIPTOR.file
+    desc_bytes4 = build_file_descriptor_set(fd4)
+    fwriter.write_channel('/driver/error_code', msg4.DESCRIPTOR.full_name, desc_bytes4)
+    fwriter.write_message('/driver/error_code', msg4.SerializeToString(), 996)
+
+    # Header
+    msg5 = Header()
+    msg5.frame_id = "6541"
+    msg5.status.msg = "header-> statuspb"
+    fd5 = msg5.DESCRIPTOR.file
+    desc_bytes5 = build_file_descriptor_set(fd5)
+    fwriter.write_channel('/driver/header', msg5.DESCRIPTOR.full_name, desc_bytes5)
+    fwriter.write_message('/driver/header', msg5.SerializeToString(), 998)
+
+    # SimpleMessage & Chatter (示例)
+    msg = SimpleMessage(); msg.text = "BBBB"
+    fd = msg.DESCRIPTOR.file
+    desc_bytes = build_file_descriptor_set(fd)
+    fwriter.write_channel('simplemsg_channel', msg.DESCRIPTOR.full_name, desc_bytes)
+    fwriter.write_message('simplemsg_channel', msg.SerializeToString(), 990)
+
+    msg2 = Chatter(); msg2.timestamp = 99999; msg2.lidar_timestamp = 100; msg2.seq = 1
+    fd2 = msg2.DESCRIPTOR.file
+    desc_bytes2 = build_file_descriptor_set(fd2)
+    fwriter.write_channel('chatter_a', msg2.DESCRIPTOR.full_name, desc_bytes2)
+    fwriter.write_message('chatter_a', msg2.SerializeToString(), 992)
+
+    fwriter.close()
+    print("Wrote record:", path)
+
+if __name__ == '__main__':
+    write_record('./test_writer_ordered.record')
