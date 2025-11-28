@@ -218,18 +218,29 @@ def write_record(path):
     fwriter.write_channel('/driver/header', msg5.DESCRIPTOR.full_name, desc_bytes5)
     fwriter.write_message('/driver/header', msg5.SerializeToString(), 998)
 
-    # SimpleMessage & Chatter (示例)
-    msg = SimpleMessage(); msg.text = "BBBB"
-    fd = msg.DESCRIPTOR.file
-    desc_bytes = build_file_descriptor_set(fd)
-    fwriter.write_channel('simplemsg_channel', msg.DESCRIPTOR.full_name, desc_bytes)
-    fwriter.write_message('simplemsg_channel', msg.SerializeToString(), 990)
-
-    msg2 = Chatter(); msg2.timestamp = 99999; msg2.lidar_timestamp = 100; msg2.seq = 1
-    fd2 = msg2.DESCRIPTOR.file
-    desc_bytes2 = build_file_descriptor_set(fd2)
-    fwriter.write_channel('chatter_a', msg2.DESCRIPTOR.full_name, desc_bytes2)
-    fwriter.write_message('chatter_a', msg2.SerializeToString(), 992)
+    msg6 = Point2D()
+    msg6.y = 1.8
+    fd6 = msg6.DESCRIPTOR.file
+    channel_name = f'/drivers/{msg6.DESCRIPTOR.full_name.replace(".", "_")}'
+    desc_bytes6 = build_file_descriptor_set(fd6)
+    fwriter.write_channel(channel_name, msg6.DESCRIPTOR.full_name, desc_bytes6)
+    fwriter.write_message(channel_name, msg6.SerializeToString(), 998)
+        
+    msg7 = Point3D()
+    msg7.x = 3.5
+    fd7 = msg7.DESCRIPTOR.file
+    channel_name = f'/drivers/{msg7.DESCRIPTOR.full_name.replace(".", "_")}'
+    desc_bytes7 = build_file_descriptor_set(fd7)
+    fwriter.write_channel(channel_name, msg7.DESCRIPTOR.full_name, desc_bytes7)
+    fwriter.write_message(channel_name, msg7.SerializeToString(), 998)
+  
+    msg8 = SensorParameters()
+    msg8.vehicle_id = "dsawuyi321321"
+    fd8 = msg8.DESCRIPTOR.file
+    desc_bytes8 = build_file_descriptor_set(fd8)
+    debug_print_descriptor_names(desc_bytes8)
+    fwriter.write_channel('/calibration', msg8.DESCRIPTOR.full_name, desc_bytes8)
+    fwriter.write_message('/calibration', msg8.SerializeToString(), 998)
 
     fwriter.close()
     print("Wrote record:", path)
