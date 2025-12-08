@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -12,7 +13,7 @@ import (
 	tester "6.5840/tester1"
 )
 
-// 
+//
 // 客户端请求的正常处理流程如下：
 // 客户端向服务领导者发送请求；
 // 服务领导者调用rsm.Submit()提交该请求；
@@ -67,8 +68,10 @@ type RSM struct {
 	sm           StateMachine
 
 	// Your definitions here.
-	seqNo int // 提交请求的序列号
+	seqNo int // 提交请求指令的序列号
 	smCh  chan StateMachineResult // 读协程从通道中获取消息后反馈给Submit
+	waitSmCh	bool	// rsm调用Start，等待smCh信道反馈
+	resultMap 	sync.Map // key: 指令ID(string), value: chan bool
 }
 
 // servers[] contains the ports of the set of
@@ -94,30 +97,42 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		seqNo:        0,
 		smCh:		  make(chan StateMachineResult),
+		waitSmCh:	  false,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	fmt.Println("me:", me)
-	go rsm.DealApplyMsg()
+	go rsm.reader()
 	return rsm
 }
 
-// 
-func (rsm *RSM) DealApplyMsg() {
-	for {
-		msg := <- rsm.applyCh
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh  {
+
 		rsm.mu.Lock()
-		
 		op, ok := msg.Command.(Op)
-		DPrintf("DealApplyMsg, msg:%v, ok:%v, op:%v", msg.Command, ok, op)
+		DPrintf("RSM reader获取到日志[S%d], msg:%v, ok:%v, op:%v", rsm.me, msg.Command, ok, op)
 		var res any
-		res = nil
 		if msg.CommandValid && ok{
-			res = rsm.sm.DoOp(op)
-		} 
+			res = rsm.sm.DoOp(op.Req)
+		}else{
+			DPrintf("S%d CommandValid %v or ok %v 不对", rsm.me, msg.CommandValid, ok)
+			rsm.mu.Unlock()
+			continue
+		}
+		val, ok := rsm.resultMap.Load(op)
+		if !ok {
+			rsm.mu.Unlock()
+			// 没找到，不用通知Start方法
+			continue
+		}
+		smRes := StateMachineResult{Msg: msg, Res:res}
+		resultChan, ok := val.(chan StateMachineResult)
+		if ok {
+			resultChan <- smRes
+		}
 		rsm.mu.Unlock()
-		rsm.smCh <- StateMachineResult{msg, res}
 	}
 }
 
@@ -129,35 +144,48 @@ func (rsm *RSM) Raft() raftapi.Raft {
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
 
+	// 1. 生成提交指令，查询sync.Map表看是否已经提交过该指令，如果提交过，则直接返回
 	rsm.mu.Lock()
-	defer rsm.mu.Unlock()
-
 	op := Op{Me: rsm.me, Id: rsm.seqNo, Req: req}
+	if _, exists := rsm.resultMap.Load(op); exists {
+		rsm.mu.Unlock()
+		// 该指令已经被提交过，没必要提交第二次了
+		DPrintf("S%d 重复提交日志%v，直接退出", rsm.me, op)
+		return rpc.ErrMaybe, nil
+	}
+
+	// 2. 提交该指令到Raft，并创建sync.Map的key, value等待reader协程反馈消息
 	rsm.seqNo++
-
 	DPrintf("[Start] me:%d,op:%v", rsm.me, op)
-
-	idx, term, ok := rsm.Raft().Start(op)
+	_, _, ok := rsm.Raft().Start(op)
+ 	
 	if !ok {
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
-	
-	// fmt.Println("try to send me:", rsm.me, ", op: ", op, ",idx", idx, ", term:", term, ", req:", req)
-	DPrintf("try to send,me:%d,op:%v, idx:%v, term:%v, ok:%v ", rsm.me, op, idx, term, ok)
+	resultChan := make(chan StateMachineResult, 1)
+	rsm.resultMap.Store(op, resultChan)
+	defer func() {
+		// 函数退出时清理映射和通道，防止泄漏
+		rsm.resultMap.Delete(op)
+		close(resultChan)
+	}()
 
-	msg, res := <- rsm.smCh
-	DPrintf("me:%d, msg:%v, res:%v", rsm.me, msg, res)
-	// msg := <- rsm.applyCh
-	// if idx == msg.CommandIndex && msg.Command == op{
-	// 	fmt.Println("msg success:", msg)
-	// 	return rpc.OK ,rsm.sm.DoOp(op.Req)
-	// }
-	return rpc.ErrWrongLeader, nil
+	rsm.mu.Unlock()
+
+	// 3. 等待协程返回消息，2s超时若还没返回，则直接结束。
+	select {
+	case result := <-resultChan:
+		DPrintf("[Start] RSM成功返回消息，S%d,op:%v", rsm.me, op)
+		return rpc.OK, result.Res
+	case <-time.After(time.Second * 2): // 2秒超时
+		return rpc.ErrMaybe, nil
+	}
+
 	// your code here
 	// return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 }
