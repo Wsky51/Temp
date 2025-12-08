@@ -288,6 +288,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3. 到此处，说明PrevLogIndex和PrevLogTerm完全匹配上了
 	for i, v := range args.Entries {
         idx := args.PrevLogIndex + 1 + i
+		if idx <= rf.lastIncludedIndex {
+			continue
+		}
 		// 跳过那些重复的日志
 		if idx <= rf.getLastLogIdx() {
 			if rf.getLogEntry(idx).Term != v.Term {
