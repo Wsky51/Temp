@@ -8,7 +8,8 @@ package raft
 
 import (
 	"bytes"
-	// "go/printer"
+	"fmt"
+	"context"
 	"math/rand"
 
 	// "sort"
@@ -69,7 +70,10 @@ type Raft struct {
 	//snapshot
 	lastIncludedIndex int // 日志压缩
 	lastIncludedTerm int // 日志压缩
-	
+
+	//raft关闭lab4需要用到
+	ctx context.Context 
+	cancel context.CancelFunc 
 }
 
 // return currentTerm and whether this server
@@ -330,9 +334,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 		DebugPretty(dSnap, "S%d(%d) <- S%d(%d) snapshot 任期不满足", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 		return
+	}else if args.Term > rf.currentTerm {
+		rf.becomeFollwer(args.Term, true)
 	}
 
-	rf.becomeFollwer(args.Term, true)
 	reply.Term = rf.currentTerm
 
 	// 3. 快照有效性校验
@@ -410,7 +415,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.resetTimeout()
 		rf.persist()
-		DebugPretty(dVote, "S%d <- (rpc)S%d 投票请求并赞成，args:%v", rf.me, args.CandidateId, args)
+		DebugPretty(dVote, "S%d(%d) <- (rpc)S%d(%d) 投票请求并赞成，args:%v", rf.me, rf.currentTerm, args.CandidateId,args.Term, args)
 		return
 	}
 	DebugPretty(dVote, "S%d(%d) <- S%d(%d) 投票请求并拒绝，args:%v, 日志是否更新:%v, votedFor:%v", rf.me, rf.currentTerm, args.CandidateId, args.Term, args, is_lognewer, rf.votedFor)
@@ -647,8 +652,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
+	fmt.Printf("Warning, %d had been killed!", rf.me)
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.cancel()
 }
 
 func (rf *Raft) killed() bool {
@@ -819,15 +826,26 @@ func (rf *Raft) applyMsg() {
 				rf.lastApplied = rf.lastIncludedIndex
 				DebugPretty(dCommit, "S%d 提交snapshot到通道，idx: %d", rf.me, rf.lastIncludedIndex)
 				rf.mu.Unlock()
-				rf.applyCh <- msg
-				continue
+				select {
+					case <-rf.ctx.Done(): // 接收到kill信号，关闭通道并退出
+						close(rf.applyCh)
+						return
+					case rf.applyCh <- msg:
+						continue
+				}
 			}
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
 				msg := raftapi.ApplyMsg{CommandValid: true, Command: rf.getLogEntry(rf.lastApplied).Command, CommandIndex: rf.lastApplied}
 				DebugPretty(dCommit, "S%d 提交日志%v(%d)到通道", rf.me, rf.getLogEntry(rf.lastApplied).Command, rf.lastApplied)
+				fmt.Printf("S%d 提交日志到通道, log: %v\n", rf.me, msg)
 				rf.mu.Unlock()
-				rf.applyCh <- msg
+				select {
+					case <-rf.ctx.Done(): // 接收到kill信号，关闭通道并退出
+						close(rf.applyCh)
+						return
+					case rf.applyCh <- msg:
+				}
 				rf.mu.Lock()
 			}
 		}
@@ -909,6 +927,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
+	rf.ctx, rf.cancel = context.WithCancel(context.Background())
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
