@@ -69,9 +69,8 @@ type RSM struct {
 
 	// Your definitions here.
 	seqNo int // 提交请求指令的序列号
-	smCh  chan StateMachineResult // 读协程从通道中获取消息后反馈给Submit
-	waitSmCh	bool	// rsm调用Start，等待smCh信道反馈
 	resultMap 	sync.Map // key: 指令ID(string), value: chan bool
+	killed		bool 	// kill 状态
 }
 
 // servers[] contains the ports of the set of
@@ -96,8 +95,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
 		seqNo:        0,
-		smCh:		  make(chan StateMachineResult),
-		waitSmCh:	  false,
+		killed: 	  false,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -109,11 +107,11 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh  {
-
-		rsm.mu.Lock()
 		op, ok := msg.Command.(Op)
 		DPrintf("RSM reader获取到日志[S%d], msg:%v, ok:%v, op:%v", rsm.me, msg.Command, ok, op)
 		var res any
+
+		rsm.mu.Lock()
 		if msg.CommandValid && ok{
 			res = rsm.sm.DoOp(op.Req)
 		}else{
@@ -122,8 +120,9 @@ func (rsm *RSM) reader() {
 			continue
 		}
 		val, ok := rsm.resultMap.Load(op)
+		rsm.mu.Unlock()
+
 		if !ok {
-			rsm.mu.Unlock()
 			// 没找到，不用通知Start方法
 			continue
 		}
@@ -132,8 +131,10 @@ func (rsm *RSM) reader() {
 		if ok {
 			resultChan <- smRes
 		}
-		rsm.mu.Unlock()
 	}
+	rsm.mu.Lock()
+	rsm.killed = true
+	rsm.mu.Unlock()
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -158,10 +159,15 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrMaybe, nil
 	}
 
+	if rsm.killed {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
 	// 2. 提交该指令到Raft，并创建sync.Map的key, value等待reader协程反馈消息
 	rsm.seqNo++
 	DPrintf("[Start] me:%d,op:%v", rsm.me, op)
-	_, _, ok := rsm.Raft().Start(op)
+	index, term, ok := rsm.Raft().Start(op)
  	
 	if !ok {
 		rsm.mu.Unlock()
@@ -178,12 +184,27 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Unlock()
 
 	// 3. 等待协程返回消息，2s超时若还没返回，则直接结束。
-	select {
-	case result := <-resultChan:
-		DPrintf("[Start] RSM成功返回消息，S%d,op:%v", rsm.me, op)
-		return rpc.OK, result.Res
-	case <-time.After(time.Second * 2): // 2秒超时
-		return rpc.ErrMaybe, nil
+	for {
+		select {
+			case result := <-resultChan:
+				DPrintf("[Start] RSM成功返回消息，S%d,op:%v", rsm.me, op)
+				return rpc.OK, result.Res
+			case <-time.After(time.Second * 2): // 2秒超时
+				return rpc.ErrMaybe, nil
+			default:
+				rsm.mu.Lock()
+				if rsm.killed {
+					rsm.mu.Unlock()
+					return rpc.ErrWrongLeader, nil
+				}
+				// 检查当前term是否变化（失去leader）
+				currentTerm, isCurrentLeader := rsm.rf.GetState()
+				rsm.mu.Unlock()
+				if currentTerm != term || !isCurrentLeader {
+					DPrintf("RSM[%d] lost leader (term %d -> %d), index %d", rsm.me, term, currentTerm, index)
+					return rpc.ErrWrongLeader, nil
+				}
+		}
 	}
 
 	// your code here
