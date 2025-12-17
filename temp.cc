@@ -1,303 +1,65 @@
-#!/usr/bin/env python3
-# 把依赖的 proto 描述符显式写入 record（先写依赖 channel），确保 cyber_monitor 回放时能注册这些类型。
-from google.protobuf import descriptor_pool
+#!/usr/bin/env bash
 
+cd "$( dirname "${BASH_SOURCE[0]}" )/.."
 
-from modules.msg.basic_msgs.header_pb2 import Header
-from modules.msg.basic_msgs.geometry_pb2 import Point3D, Point2D
-from modules.msg.perception_msgs.dynamic_common_pb2 import *
-from modules.msg.perception_msgs.perception_desensization_pb2 import DesensizationInfoObject
+overlay_mount() {
+  real_app_path="$1"
+  # Hot upgrade service pkg, for service pkg, implement overlay mount
+  if [[ -e "$real_app_path" && "$real_app_path" != "/app" ]]; then
+    dir_part=$(dirname "$real_app_path") 
+    file_part=$(basename "$real_app_path")
+    overlay_mount_shell="${dir_part}/.layers_${file_part}/${file_part}/.hot_upgrade_meta/overlay_mount.sh"
+    # 执行挂载的前提条件，挂载脚本存在，且目标目录没被挂载过
+    if [ -f "$overlay_mount_shell" ] && ! mountpoint -q "${real_app_path}"; then
+      mount_res=$(bash "${overlay_mount_shell}")
+      check_code=$?
+      if [[ ! $check_code -eq 0 ]]; then
+        echo "[app_path_switch] ${current_date} overlay mount failed! ret: ${check_code}, detail:${mount_res}" >> "${APP_PATH_SWITCH_LOG}"
+      else
+        echo "[app_path_switch] ${current_date} overlay mount success for ${real_app_path}" >> "${APP_PATH_SWITCH_LOG}"
+      fi
+    fi
+  fi
+}
 
-from cyber.python.cyber_py3 import cyber
-from cyber.python.cyber_py3 import record
-from cyber.proto.simple_pb2 import SimpleMessage
-from cyber.proto.unit_test_pb2 import Chatter
-from modules.msg.state_machine_msgs.top_state_pb2 import TopState
-from modules.msg.basic_msgs.error_code_pb2 import StatusPb
-from modules.msg.basic_msgs.header_pb2 import Header
-from modules.msg.calib_msgs.calib_param_pb2 import SensorParameters
+CUR_APP_RUN_PATH="/userdata/mnt/hot_upgrade/storage/.app_path"
+NEXT_APP_RUN_PATH="/userdata/mnt/hot_upgrade/storage/.next_app_path"
+APP_RESTART_TAG="/tmp/hot_upgrade_restart_app_request"
+BASE_ORIN_LOG_PATH="/applog/applog/orin_log" # Default orin log path
 
-from enum import Enum
-from typing import Optional, Set
-import sys
+# Overwrite if path exist
+if [[ -e "/dataloop1/applog/orin_log" ]]; then
+  BASE_ORIN_LOG_PATH="/dataloop1/applog/orin_log"
+fi
 
-from google.protobuf.descriptor_pb2 import FileDescriptorProto
-from google.protobuf.descriptor import Descriptor, FileDescriptor
+APP_PATH_SWITCH_LOG="${BASE_ORIN_LOG_PATH}/app_upgrade_mgr.log"
 
-# 兼容不同protobuf版本的DescriptorDatabase导入
-try:
-    from google.protobuf.descriptor_database import DescriptorDatabase
-except ImportError:
-    from google.protobuf.descriptor_pool import DescriptorDatabase
-from google.protobuf.descriptor_pool import DescriptorPool
-from google.protobuf.message_factory import MessageFactory
-from google.protobuf.descriptor_pb2 import FileDescriptorSet
+mkdir -p /userdata/mnt/hot_upgrade/storage
+mkdir -p /userdata/mnt/hot_upgrade/runtime/A
+mkdir -p /userdata/mnt/hot_upgrade/runtime/B
+mkdir -p "${BASE_ORIN_LOG_PATH}"
+mkdir -p /run/app
 
-# 复用之前的Status类定义
-class StatusCode(Enum):
-    OK = 0
-    INVALID_ARGUMENT = 1
-    IO_OR_DESCRIPTOR_FATAL = 2
+current_date=$(date +"%Y-%m-%d %H:%M:%S")
 
-class Status:
-    def __init__(self, code: StatusCode, message: str = ""):
-        self.code = code
-        self.message = message
-
-    @classmethod
-    def Ok(cls):
-        return cls(StatusCode.OK)
-
-    @classmethod
-    def InvalidArgument(cls, message: str):
-        return cls(StatusCode.INVALID_ARGUMENT, message)
-
-    @classmethod
-    def IoOrDescriptorFatal(cls, message: str):
-        return cls(StatusCode.IO_OR_DESCRIPTOR_FATAL, message)
-
-    def ok(self) -> bool:
-        return self.code == StatusCode.OK
-
-
-# 定义DynamicContext类
-class DynamicContext:
-    def __init__(self):
-        self.pool: Optional[DescriptorPool] = None
-        self.factory: Optional[MessageFactory] = None
-
-def BuildMinimalFDSFromType(pool, type_full_name: str) -> bytes:
-
-    # 1. 根据类型全名获取Descriptor
-    try:
-        descriptor = pool.FindMessageTypeByName(type_full_name)
-    except KeyError:
-        # 类型不存在时返回False
-        return None
-    if descriptor is None:
-        return None
-
-    # 2. 获取对应的FileDescriptor
-    file_desc: FileDescriptor = descriptor.file
-    if file_desc is None:
-        return None
-
-    file_descriptor_set = FileDescriptorSet()
-    processed_files: Set[str] = set()
-
-    # 3. 递归收集所有依赖的文件描述符
-    def collect_dependencies(current_file: FileDescriptor):
-        if current_file is None:
-            return
-
-        file_name = current_file.name
-        if file_name in processed_files:
-            return
-
-        processed_files.add(file_name)
-
-        # 先递归处理所有依赖项
-        for dep_file in current_file.dependencies:
-            collect_dependencies(dep_file)
-
-        # 将当前文件描述符转换为FileDescriptorProto并添加到集合
-        file_proto = FileDescriptorProto()
-        current_file.CopyToProto(file_proto)
-
-        # 确保依赖列表正确（清除后重新添加，与C++逻辑一致）
-        file_proto.dependency[:] = [dep.name for dep in current_file.dependencies]
-
-        # 添加到FileDescriptorSet
-        file_descriptor_set.file.append(file_proto)
-
-    # 4. 从目标文件开始收集
-    collect_dependencies(file_desc)
-
-    return file_descriptor_set.SerializeToString()
-    
-def MakeDynamicContext(fds, ctx: Optional[DynamicContext]) -> Status:
-    if ctx is None:
-        return Status.InvalidArgument("ctx is null")
-    
-    # 1. 创建描述符数据库（修正后的DescriptorDatabase）
-    db = DescriptorDatabase()
-    
-    # 2. 遍历FileDescriptorSet中的每个FileDescriptorProto并添加到数据库
-    for fd_proto in fds.file:
-        try:
-            db.Add(fd_proto)
-        except Exception as e:
-            print(f"[ERROR] DescriptorDatabase Add failed for: {fd_proto.name}", file=sys.stderr)
-            return Status.IoOrDescriptorFatal(f"db add failed: {fd_proto.name}, error: {str(e)}")
-    
-    # 3. 创建基于数据库的DescriptorPool
-    pool = DescriptorPool(db)
-    
-    # 4. 创建动态消息工厂
-    factory = MessageFactory(pool=pool)
-    
-    # 5. 赋值到DynamicContext
-    ctx.pool = pool
-    ctx.factory = factory
-    
-    print(f"[INFO] DynamicContext created with {len(fds.file)} files")
-    return Status.Ok()
-
-# 加载FileDescriptorSet的函数（复用之前的实现）
-def LoadFileDescriptorSetFromFile(path: str, out: Optional[FileDescriptorSet]) -> Status:
-    if out is None:
-        print(f"[ERROR] Descriptor loader: out=nullptr", file=sys.stderr)
-        return Status.InvalidArgument("out is null")
-    
-    try:
-        with open(path, "rb") as f:
-            out.ParseFromString(f.read())
-    except FileNotFoundError:
-        print(f"[ERROR] Cannot open desc file: {path}", file=sys.stderr)
-        return Status.IoOrDescriptorFatal(f"open desc failed: {path}")
-    except Exception as e:
-        print(f"[ERROR] Parse FileDescriptorSet failed: {path}", file=sys.stderr)
-        return Status.IoOrDescriptorFatal(f"parse desc failed: {path}, error: {str(e)}")
-    
-    print(f"[INFO] Loaded FileDescriptorSet: {path}")
-    return Status.Ok()
-
-def debug_print_descriptor_names(desc_bytes):
-    f = FileDescriptorSet()
-    f.ParseFromString(desc_bytes)
-    print("DescriptorSet contains files in this order:")
-    for pf in f.file:
-        print(" -", pf.name)
-
-
-def build_file_descriptor_set(fd):
-    """
-    修复：直接遍历FileDescriptor的dependencies属性，确保收集所有依赖
-    """
-    pool = descriptor_pool.Default()
-    fset = FileDescriptorSet()
-    seen = set()  # 记录已处理的FileDescriptor.name
-    added = set() # 记录已添加到fset的文件名
-
-    def collect_fd(fd_obj):
-        """递归收集FileDescriptor及其依赖（post-order）"""
-        if fd_obj.name in seen:
-            return
-        seen.add(fd_obj.name)
-        
-        # 先递归处理所有依赖的FileDescriptor
-        for dep_fd in fd_obj.dependencies:
-            collect_fd(dep_fd)
-        
-        # 再将当前FileDescriptor转为Proto并加入fset
-        if fd_obj.name not in added:
-            added.add(fd_obj.name)
-            proto = FileDescriptorProto()
-            fd_obj.CopyToProto(proto)
-            fset.file.append(proto)
-
-    # 处理输入（支持FileDescriptor或文件名）
-    if hasattr(fd, 'name'):
-        target_fd = fd
-    else:
-        target_fd = pool.FindFileByName(fd)
-        if not target_fd:
-            raise ValueError(f"FileDescriptor {fd} not found in pool!")
-    
-    collect_fd(target_fd)
-    
-    
-    return fset.SerializeToString()
-
-def write_record(path):
-    
-    new_desc_path = "/apollo/software/msg_converter/out/all.descriptor_set"
-    fds = FileDescriptorSet()
-    st = LoadFileDescriptorSetFromFile(new_desc_path, fds)
-    if not st.ok():
-        sys.exit(1)
-    cyber.init()
-    
-    ctx = DynamicContext()
-    out_bytes  = MakeDynamicContext(fds, ctx)
-    
-    out_fds_bytes = BuildMinimalFDSFromType(ctx.pool, "byd.msg.state_machine.TopState")
-    print(f"out_fds_bytes:{out_fds_bytes}")
-    
-    
-    fwriter = record.RecordWriter()
-    fwriter.set_size_fileseg(0)
-    fwriter.set_intervaltime_fileseg(0)
-    if not fwriter.open(path):
-        print('Failed to open record writer!')
-        return
-
-    # 其余示例通道（可选）
-    # Error code
-    msg4 = StatusPb()
-    msg4.msg = "hello wuti"
-    channel_name = f'/drivers/{msg4.DESCRIPTOR.full_name.replace(".", "_")}'
-    # channel_name = f'/drivers/error_code'
-    fd4 = msg4.DESCRIPTOR.file
-    desc_bytes4 = build_file_descriptor_set(fd4)
-    fwriter.write_channel(channel_name, msg4.DESCRIPTOR.full_name, desc_bytes4)
-    fwriter.write_message(channel_name, msg4.SerializeToString(), 996)
-
-    # Header
-    msg5 = Header()
-    msg5.frame_id = "6541"
-    msg5.status.msg = "header-> statuspb"
-    channel_name = f'/drivers/{msg5.DESCRIPTOR.full_name.replace(".", "_")}'
-    # channel_name = f'/drivers/header'
-    fd5 = msg5.DESCRIPTOR.file
-    desc_bytes5 = build_file_descriptor_set(fd5)
-    fwriter.write_channel(channel_name, msg5.DESCRIPTOR.full_name, desc_bytes5)
-    fwriter.write_message(channel_name, msg5.SerializeToString(), 998)
-    pool = descriptor_pool.Default()
-    descriptor = pool.FindMessageTypeByName(msg5.DESCRIPTOR.full_name)
-    print(f"header descriptor:{descriptor} ")
-    
-    msg6 = Point2D()
-    msg6.y = 1.8
-    fd6 = msg6.DESCRIPTOR.file
-    channel_name = f'/drivers/{msg6.DESCRIPTOR.full_name.replace(".", "_")}'
-    desc_bytes6 = build_file_descriptor_set(fd6)
-    fwriter.write_channel(channel_name, msg6.DESCRIPTOR.full_name, desc_bytes6)
-    fwriter.write_message(channel_name, msg6.SerializeToString(), 998)
-        
-    msg7 = Point3D()
-    msg7.x = 3.5
-    fd7 = msg7.DESCRIPTOR.file
-    channel_name = f'/drivers/{msg7.DESCRIPTOR.full_name.replace(".", "_")}'
-    desc_bytes7 = build_file_descriptor_set(fd7)
-    fwriter.write_channel(channel_name, msg7.DESCRIPTOR.full_name, desc_bytes7)
-    fwriter.write_message(channel_name, msg7.SerializeToString(), 998)
-    
-
-
-    # 现在写 TopState（其 FileDescriptorSet 也会包含依赖）
-    msg6 = TopState()
-    msg6.system_state = 0
-    msg6.state = 2
-    fd6 = msg6.DESCRIPTOR.file
-    desc_bytes6 = build_file_descriptor_set(fd6)
-    print("topstate type:", msg6.DESCRIPTOR.full_name)
-    debug_print_descriptor_names(desc_bytes6)
-    # print(f"desc_bytes6:{desc_bytes6}")
-    fwriter.write_channel('/state_machine/top_state/state', msg6.DESCRIPTOR.full_name, desc_bytes6)
-    fwriter.write_message('/state_machine/top_state/state', msg6.SerializeToString(), 994)
-
-    msg8 = SensorParameters()
-    msg8.vehicle_id = "dsawuyi321321"
-    fd8 = msg8.DESCRIPTOR.file
-    desc_bytes8 = build_file_descriptor_set(fd8)
-    debug_print_descriptor_names(desc_bytes8)
-    print("SensorParameters full name:", msg8.DESCRIPTOR.full_name)
-    fwriter.write_channel('/calibration', msg8.DESCRIPTOR.full_name, desc_bytes8)
-    fwriter.write_message('/calibration', msg8.SerializeToString(), 998)
-
-    fwriter.close()
-    print("Wrote record:", path)
-
-if __name__ == '__main__':
-    write_record('./test_writer_with_deps_first.record')
+if [[ ! -e "$CUR_APP_RUN_PATH" ]] && [[ ! -e "$NEXT_APP_RUN_PATH" ]]; then # 如果.app_path和.next_app_path不存在，直接写入/app根目录到该文件里
+  echo "/app" > "${CUR_APP_RUN_PATH}"
+  echo "[app_path_switch] ${current_date} reset cur app path to /app" >> "${APP_PATH_SWITCH_LOG}"
+  python3 modules/applications/hot_upgrade/script/app_mgr.py -c check_app_path -p 0
+elif [[ -f "$NEXT_APP_RUN_PATH" ]]; then # 如果.next_app_path存在，则作为本次要运行的目录
+  ready_path="$(cat ${NEXT_APP_RUN_PATH})"
+  mv "${NEXT_APP_RUN_PATH}" "${CUR_APP_RUN_PATH}"
+  overlay_mount "${ready_path}"
+  echo "[app_path_switch] ${current_date} mv next app path ${ready_path} to cur app path" >> "${APP_PATH_SWITCH_LOG}"
+  python3 modules/applications/hot_upgrade/script/app_mgr.py -c check_app_path -p 1
+else # 如果.next_app_path不存在且.app_path存在
+  ready_path="$(cat ${CUR_APP_RUN_PATH})"
+  overlay_mount "${ready_path}"
+  echo "[app_path_switch] ${current_date} directly run app_path ${ready_path}" >> "${APP_PATH_SWITCH_LOG}"
+  if [[ -f "$APP_RESTART_TAG" ]]; then # 说明是服务自检没通过的异常场景
+    echo "[app_path_switch] ${current_date} restart_app scenario, will check and revert to new app path" >> "${APP_PATH_SWITCH_LOG}"
+    python3 modules/applications/hot_upgrade/script/app_mgr.py -c check_app_path -p 1
+  else
+    python3 modules/applications/hot_upgrade/script/app_mgr.py -c check_app_path -p 0
+  fi
+fi
