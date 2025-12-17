@@ -103,14 +103,14 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
-	fmt.Println("me:", me)
+	fmt.Println("RSM init me:", me)
 	go rsm.reader()
 	return rsm
 }
 
-func (rsm *RSM) getOpKey(op Op) string {
-    return fmt.Sprintf("%d-%d", op.Me, op.Id)
-}
+// func (rsm *RSM) getOpKey(op Op) string {
+//     return fmt.Sprintf("%d-%d", op.Me, op.Id)
+// }
 
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh  {
@@ -126,10 +126,9 @@ func (rsm *RSM) reader() {
 			rsm.mu.Unlock()
 			continue
 		}
-		
-		rsm.mu.Unlock()
 		smRes := StateMachineResult{Msg: msg, Res:res}
-		val, val_ok := rsm.resultMap.Load(rsm.getOpKey(op))
+		val, val_ok := rsm.resultMap.Load(msg.CommandIndex)
+		rsm.mu.Unlock()
 		if !val_ok {
 			continue
 		}
@@ -160,12 +159,12 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Lock()
 	op := Op{Me: rsm.me, Id: rsm.seqNo, Req: req}
 	rsm.seqNo++
-	if _, exists := rsm.resultMap.Load(rsm.getOpKey(op)); exists {
-		rsm.mu.Unlock()
-		// 该指令已经被提交过，没必要提交第二次了
-		DPrintf("S%d 重复提交日志%v，直接退出", rsm.me, op)
-		return rpc.ErrMaybe, nil
-	}
+	// if _, exists := rsm.resultMap.Load(rsm.getOpKey(op)); exists {
+	// 	rsm.mu.Unlock()
+	// 	// 该指令已经被提交过，没必要提交第二次了
+	// 	DPrintf("S%d 重复提交日志%v，直接退出", rsm.me, op)
+	// 	return rpc.ErrMaybe, nil
+	// }
 
 	if rsm.killed {
 		rsm.mu.Unlock()
@@ -181,15 +180,18 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
 	resultChan := make(chan StateMachineResult, 1)
-	rsm.resultMap.Store(rsm.getOpKey(op), resultChan)
+	rsm.resultMap.Store(index, resultChan)
 	defer func() {
 		// 函数退出时清理映射和通道，防止泄漏
-		rsm.resultMap.Delete(rsm.getOpKey(op))
+		rsm.mu.Lock()
+		rsm.resultMap.Delete(index)
+		close(resultChan)
+		rsm.mu.Unlock()
 	}()
 
 	rsm.mu.Unlock()
 
-	// 3. 等待协程返回消息，若通道有消息则执行结束；若
+	// 3. 等待协程返回消息，若有消息则对比index是否一致，一致则成功；没有消息判断是否触发2秒超时；若都没有再检查当前状态，状态不一致则退出。
 	for {
 		select {
 			case result := <-resultChan:
