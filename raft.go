@@ -633,7 +633,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if !isLeader {
+	if !isLeader || rf.killed() {
 		return -1, -1, false // 不是leader的话直接返回
 	}
 	
@@ -851,6 +851,10 @@ func (rf *Raft) applyMsg() {
 				}
 				rf.mu.Lock()
 			}
+		}else{
+			rf.mu.Unlock()
+			close(rf.applyCh)
+			return
 		}
 		rf.mu.Unlock()
 		ms := 50 + (rand.Int63() % 300)
@@ -882,7 +886,6 @@ func (rf *Raft) ticker() {
 			rf.replicateToAllPeers()
 		}
 		rf.mu.Unlock()
-		
 	}
 }
 
