@@ -143,3 +143,539 @@ $$FFN(x) = max(0, xW_1 + b_1)W_2 + b_2$$
 2. **完美的并行计算能力**：训练阶段全序列并行，充分利用GPU的并行算力，支持大规模数据和大参数量模型的训练。
 3. **强大的特征表达能力**：多头注意力可以同时捕捉多种类型的语义、语法、依赖关系，配合非线性FFN和深层结构，特征拟合能力极强。
 4. **优秀的泛化能力**：Transformer的架构通用性极强，不仅适配NLP的所有任务，还可以扩展到语音、图像、视频等多模态领域，成为AI领域的通用基础架构。
+
+
+
+## 八、Transformer demo
+用到了英语-德语翻译任务，数据集为Multi30k
+```
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import json
+import numpy as np
+from tqdm import tqdm
+import nltk
+from nltk.tokenize import word_tokenize
+import random
+
+
+# -------------------------- 基础配置 --------------------------
+# 适配你的 5060ti 8G GPU
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {DEVICE}")
+
+# 数据集路径（你提供的路径）
+TRAIN_FILE_PATH = "/home/wuyi/code/dl/data/Multi30k/train.jsonl"
+VAL_FILE_PATH = "/home/wuyi/code/dl/data/Multi30k/val.jsonl"
+TEST_FILE_PATH = "/home/wuyi/code/dl/data/Multi30k/test.jsonl"
+
+# 超参数（轻量化，适配 8G GPU）
+EMBEDDING_DIM = 256    # 嵌入维度
+NUM_HEADS = 4          # 多头注意力头数
+FFN_HIDDEN_DIM = 512   # 前馈网络隐藏层维度
+NUM_ENCODER_LAYERS = 2 # 编码器层数
+NUM_DECODER_LAYERS = 2 # 解码器层数
+MAX_SEQ_LEN = 50       # 最大序列长度
+BATCH_SIZE = 32        # 批次大小
+EPOCHS = 10            # 训练轮数
+LEARNING_RATE = 1e-3   # 学习率
+
+# 特殊标记
+PAD_TOKEN = "<PAD>"    # 填充标记
+SOS_TOKEN = "<SOS>"    # 起始标记
+EOS_TOKEN = "<EOS>"    # 结束标记
+UNK_TOKEN = "<UNK>"    # 未知标记
+
+# -------------------------- 1. 数据预处理 --------------------------
+# 下载nltk分词器（首次运行需要）
+# nltk.download('punkt')
+
+class Vocabulary:
+    """词汇表类：将单词转为索引，索引转为单词"""
+    def __init__(self):
+        self.word2idx = {
+            PAD_TOKEN: 0,
+            SOS_TOKEN: 1,
+            EOS_TOKEN: 2,
+            UNK_TOKEN: 3
+        }
+        self.idx2word = {v: k for k, v in self.word2idx.items()}
+        self.word_count = 4  # 初始4个特殊标记
+    
+    def add_word(self, word):
+        """添加单词到词汇表"""
+        if word not in self.word2idx:
+            self.word2idx[word] = self.word_count
+            self.idx2word[self.word_count] = word
+            self.word_count += 1
+    
+    def add_sentence(self, sentence):
+        """添加整句话到词汇表"""
+        for word in word_tokenize(sentence.lower()):
+            self.add_word(word)
+    
+    def __len__(self):
+        return self.word_count
+
+class Multi30kDataset(Dataset):
+    """Multi30k数据集类"""
+    def __init__(self, file_path, src_vocab=None, tgt_vocab=None, build_vocab=True):
+        self.data = []
+        # 读取jsonl文件
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                item = json.loads(line.strip())
+                # 假设数据格式是 {"en": "英语句子", "de": "德语句子"}
+                # 如果你的数据格式不同，需要调整这里的key
+                src_sentence = item.get("en", "")
+                tgt_sentence = item.get("de", "")
+                self.data.append((src_sentence, tgt_sentence))
+        
+        # 构建词汇表
+        self.src_vocab = src_vocab if src_vocab else Vocabulary()
+        self.tgt_vocab = tgt_vocab if tgt_vocab else Vocabulary()
+        
+        if build_vocab:
+            for src_sent, tgt_sent in self.data:
+                self.src_vocab.add_sentence(src_sent)
+                self.tgt_vocab.add_sentence(tgt_sent)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def sentence_to_tensor(self, sentence, vocab):
+        """将句子转为张量（添加SOS/EOS，填充到最大长度）"""
+        # 分词 + 转索引
+        tokens = [SOS_TOKEN] + word_tokenize(sentence.lower()) + [EOS_TOKEN]
+        indices = [vocab.word2idx.get(token, vocab.word2idx[UNK_TOKEN]) for token in tokens]
+        
+        # 填充到最大长度
+        if len(indices) < MAX_SEQ_LEN:
+            indices += [vocab.word2idx[PAD_TOKEN]] * (MAX_SEQ_LEN - len(indices))
+        else:
+            indices = indices[:MAX_SEQ_LEN]  # 截断
+        
+        return torch.tensor(indices, dtype=torch.long)
+    
+    def __getitem__(self, idx):
+        src_sent, tgt_sent = self.data[idx]
+        src_tensor = self.sentence_to_tensor(src_sent, self.src_vocab)
+        tgt_tensor = self.sentence_to_tensor(tgt_sent, self.tgt_vocab)
+        return src_tensor, tgt_tensor
+
+# 构建词汇表 + 加载数据集
+print("加载数据集并构建词汇表...")
+train_dataset = Multi30kDataset(TRAIN_FILE_PATH)
+src_vocab = train_dataset.src_vocab  # 英语词汇表
+tgt_vocab = train_dataset.tgt_vocab  # 德语词汇表
+
+
+# 验证/测试集复用训练集的词汇表
+val_dataset = Multi30kDataset(VAL_FILE_PATH, src_vocab, tgt_vocab, build_vocab=False)
+test_dataset = Multi30kDataset(TEST_FILE_PATH, src_vocab, tgt_vocab, build_vocab=False)
+
+# 数据加载器
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print(f"英语词汇表大小: {len(src_vocab)}")
+print(f"德语词汇表大小: {len(tgt_vocab)}")
+
+# -------------------------- 2. Transformer 核心组件 --------------------------
+class PositionalEncoding(nn.Module):
+    """位置编码：给序列添加位置信息"""
+    def __init__(self, embedding_dim, max_len=MAX_SEQ_LEN):
+        super().__init__()
+        # 计算位置编码
+        pe = torch.zeros(max_len, embedding_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-np.log(10000.0) / embedding_dim))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维度用sin
+        pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维度用cos
+        pe = pe.unsqueeze(0)  # [1, max_len, embedding_dim]
+        self.register_buffer('pe', pe)  # 不参与训练的参数
+    
+    def forward(self, x):
+        """x: [batch_size, seq_len, embedding_dim]"""
+        x = x + self.pe[:, :x.size(1), :].to(x.device)
+        return x
+
+class MultiHeadAttention(nn.Module):
+    """多头注意力机制"""
+    def __init__(self, embedding_dim, num_heads):
+        super().__init__()
+        assert embedding_dim % num_heads == 0, "嵌入维度必须能被头数整除"
+        
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.head_dim = embedding_dim // num_heads
+        
+        # 线性层：Q/K/V 投影
+        self.q_linear = nn.Linear(embedding_dim, embedding_dim)
+        self.k_linear = nn.Linear(embedding_dim, embedding_dim)
+        self.v_linear = nn.Linear(embedding_dim, embedding_dim)
+        
+        # 输出线性层
+        self.out_linear = nn.Linear(embedding_dim, embedding_dim)
+        
+        # 缩放因子
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(DEVICE)
+    
+    def forward(self, q, k, v, mask=None):
+        """
+        q: [batch_size, q_len, embedding_dim]
+        k: [batch_size, k_len, embedding_dim]
+        v: [batch_size, v_len, embedding_dim]
+        mask: [batch_size, 1, q_len, k_len] （可选）
+        """
+        batch_size = q.size(0)
+        
+        # 投影到多个头
+        Q = self.q_linear(q)  # [batch_size, q_len, embedding_dim]
+        K = self.k_linear(k)  # [batch_size, k_len, embedding_dim]
+        V = self.v_linear(v)  # [batch_size, v_len, embedding_dim]
+        
+        # 拆分多头：[batch_size, num_heads, seq_len, head_dim]
+        Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = K.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = V.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # 计算注意力分数：Q @ K^T / scale
+        attention_scores = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.scale  # [batch_size, num_heads, q_len, k_len]
+        
+        # 应用mask（填充mask或未来mask）
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 0, -1e10)
+        
+        # 计算注意力权重
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        
+        # 加权求和
+        output = torch.matmul(attention_weights, V)  # [batch_size, num_heads, q_len, head_dim]
+        
+        # 拼接多头
+        output = output.permute(0, 2, 1, 3).contiguous()  # [batch_size, q_len, num_heads, head_dim]
+        output = output.view(batch_size, -1, self.embedding_dim)  # [batch_size, q_len, embedding_dim]
+        
+        # 输出投影
+        output = self.out_linear(output)
+        
+        return output, attention_weights
+
+class FeedForwardNetwork(nn.Module):
+    """前馈网络：两层线性 + ReLU"""
+    def __init__(self, embedding_dim, hidden_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(embedding_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, embedding_dim)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        """x: [batch_size, seq_len, embedding_dim]"""
+        return self.linear2(self.relu(self.linear1(x)))
+
+class EncoderLayer(nn.Module):
+    """编码器单层：多头自注意力 + 前馈网络 + 残差连接 + 层归一化"""
+    def __init__(self, embedding_dim, num_heads, ffn_hidden_dim):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(embedding_dim, num_heads)
+        self.ffn = FeedForwardNetwork(embedding_dim, ffn_hidden_dim)
+        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        
+        # Dropout（可选，增加鲁棒性）
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, x, src_mask):
+        """
+        x: [batch_size, src_len, embedding_dim]
+        src_mask: [batch_size, 1, src_len, src_len]
+        """
+        # 自注意力 + 残差连接 + 层归一化
+        attn_output, _ = self.self_attn(x, x, x, src_mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        
+        # 前馈网络 + 残差连接 + 层归一化
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_output))
+        
+        return x
+
+class DecoderLayer(nn.Module):
+    """解码器单层：掩码自注意力 + 编码器-解码器注意力 + 前馈网络"""
+    def __init__(self, embedding_dim, num_heads, ffn_hidden_dim):
+        super().__init__()
+        self.masked_self_attn = MultiHeadAttention(embedding_dim, num_heads)  # 掩码自注意力
+        self.enc_dec_attn = MultiHeadAttention(embedding_dim, num_heads)      # 编码器-解码器注意力
+        self.ffn = FeedForwardNetwork(embedding_dim, ffn_hidden_dim)
+        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        self.norm3 = nn.LayerNorm(embedding_dim)
+        
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, x, enc_output, tgt_mask, src_tgt_mask):
+        """
+        x: [batch_size, tgt_len, embedding_dim]
+        enc_output: [batch_size, src_len, embedding_dim]
+        tgt_mask: [batch_size, 1, tgt_len, tgt_len] （未来掩码）
+        src_tgt_mask: [batch_size, 1, tgt_len, src_len] （填充掩码）
+        """
+        # 1. 掩码自注意力
+        attn1_output, _ = self.masked_self_attn(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout(attn1_output))
+        
+        # 2. 编码器-解码器注意力
+        attn2_output, _ = self.enc_dec_attn(x, enc_output, enc_output, src_tgt_mask)
+        x = self.norm2(x + self.dropout(attn2_output))
+        
+        # 3. 前馈网络
+        ffn_output = self.ffn(x)
+        x = self.norm3(x + self.dropout(ffn_output))
+        
+        return x
+
+class Transformer(nn.Module):
+    """完整的Transformer模型"""
+    def __init__(self, src_vocab_size, tgt_vocab_size, embedding_dim, num_heads, 
+                 ffn_hidden_dim, num_encoder_layers, num_decoder_layers):
+        super().__init__()
+        
+        # 嵌入层
+        self.src_embedding = nn.Embedding(src_vocab_size, embedding_dim)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, embedding_dim)
+        
+        # 位置编码
+        self.positional_encoding = PositionalEncoding(embedding_dim)
+        
+        # 编码器
+        self.encoder_layers = nn.ModuleList([
+            EncoderLayer(embedding_dim, num_heads, ffn_hidden_dim) 
+            for _ in range(num_encoder_layers)
+        ])
+        
+        # 解码器
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(embedding_dim, num_heads, ffn_hidden_dim) 
+            for _ in range(num_decoder_layers)
+        ])
+        
+        # 输出层（映射到目标词汇表）
+        self.fc_out = nn.Linear(embedding_dim, tgt_vocab_size)
+        
+        # Dropout
+        self.dropout = nn.Dropout(0.1)
+    
+    def create_src_mask(self, src):
+        """创建源序列掩码（屏蔽PADToken）"""
+        # src: [batch_size, src_len]
+        src_mask = (src != src_vocab.word2idx[PAD_TOKEN]).unsqueeze(1).unsqueeze(2)
+        # src_mask: [batch_size, 1, 1, src_len]
+        return src_mask.to(DEVICE)
+    
+    def create_tgt_mask(self, tgt):
+        """创建目标序列掩码（屏蔽PADToken + 未来信息）"""
+        # tgt: [batch_size, tgt_len]
+        batch_size, tgt_len = tgt.shape
+        
+        # 1. 填充掩码
+        tgt_pad_mask = (tgt != tgt_vocab.word2idx[PAD_TOKEN]).unsqueeze(1).unsqueeze(2)
+        # tgt_pad_mask: [batch_size, 1, 1, tgt_len]
+        
+        # 2. 未来掩码（上三角矩阵，屏蔽未来token）
+        tgt_subsequent_mask = torch.tril(torch.ones((tgt_len, tgt_len), device=DEVICE)).bool()
+        # tgt_subsequent_mask: [tgt_len, tgt_len]
+        
+        # 合并掩码
+        tgt_mask = tgt_pad_mask & tgt_subsequent_mask
+        # tgt_mask: [batch_size, 1, tgt_len, tgt_len]
+        return tgt_mask.to(DEVICE)
+    
+    def forward(self, src, tgt):
+        """
+        src: [batch_size, src_len]
+        tgt: [batch_size, tgt_len]
+        """
+        # 1. 创建掩码
+        src_mask = self.create_src_mask(src)
+        tgt_mask = self.create_tgt_mask(tgt)
+        src_tgt_mask = self.create_src_mask(src)  # 编码器-解码器注意力的掩码
+        
+        # 2. 源序列编码
+        src_emb = self.dropout(self.positional_encoding(self.src_embedding(src)))
+        enc_output = src_emb
+        for enc_layer in self.encoder_layers:
+            enc_output = enc_layer(enc_output, src_mask)
+        
+        # 3. 目标序列解码
+        tgt_emb = self.dropout(self.positional_encoding(self.tgt_embedding(tgt)))
+        dec_output = tgt_emb
+        for dec_layer in self.decoder_layers:
+            dec_output = dec_layer(dec_output, enc_output, tgt_mask, src_tgt_mask)
+        
+        # 4. 输出投影
+        output = self.fc_out(dec_output)
+        
+        return output
+
+# -------------------------- 3. 训练和测试 --------------------------
+# 初始化模型
+model = Transformer(
+    src_vocab_size=len(src_vocab),
+    tgt_vocab_size=len(tgt_vocab),
+    embedding_dim=EMBEDDING_DIM,
+    num_heads=NUM_HEADS,
+    ffn_hidden_dim=FFN_HIDDEN_DIM,
+    num_encoder_layers=NUM_ENCODER_LAYERS,
+    num_decoder_layers=NUM_DECODER_LAYERS
+).to(DEVICE)
+
+# 损失函数（忽略PADToken）
+criterion = nn.CrossEntropyLoss(ignore_index=src_vocab.word2idx[PAD_TOKEN])
+
+# 优化器
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+def train_epoch(model, loader, optimizer, criterion):
+    """训练一轮"""
+    model.train()
+    total_loss = 0.0
+    
+    for batch_idx, (src_batch, tgt_batch) in enumerate(tqdm(loader, desc="训练")):
+        src_batch = src_batch.to(DEVICE)
+        tgt_batch = tgt_batch.to(DEVICE)
+        
+        # 清零梯度
+        optimizer.zero_grad()
+        
+        # 输入：tgt_batch[:, :-1]（去掉最后一个token）
+        # 目标：tgt_batch[:, 1:]（去掉第一个token）
+        output = model(src_batch, tgt_batch[:, :-1])
+        
+        # 调整形状计算损失
+        output = output.reshape(-1, output.shape[-1])
+        target = tgt_batch[:, 1:].reshape(-1)
+        
+        # 计算损失
+        loss = criterion(output, target)
+        
+        # 反向传播
+        loss.backward()
+        
+        # 梯度裁剪（防止梯度爆炸）
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # 更新参数
+        optimizer.step()
+        
+        total_loss += loss.item()
+    
+    return total_loss / len(loader)
+
+def evaluate(model, loader, criterion):
+    """验证/测试"""
+    model.eval()
+    total_loss = 0.0
+    
+    with torch.no_grad():
+        for batch_idx, (src_batch, tgt_batch) in enumerate(tqdm(loader, desc="验证")):
+            src_batch = src_batch.to(DEVICE)
+            tgt_batch = tgt_batch.to(DEVICE)
+            
+            output = model(src_batch, tgt_batch[:, :-1])
+            output = output.reshape(-1, output.shape[-1])
+            target = tgt_batch[:, 1:].reshape(-1)
+            
+            loss = criterion(output, target)
+            total_loss += loss.item()
+    
+    return total_loss / len(loader)
+
+def translate_sentence(model, sentence, src_vocab, tgt_vocab, max_len=MAX_SEQ_LEN):
+    """单句翻译（推理）"""
+    model.eval()
+    
+    # 预处理输入句子
+    tokens = [SOS_TOKEN] + word_tokenize(sentence.lower()) + [EOS_TOKEN]
+    src_indices = [src_vocab.word2idx.get(token, src_vocab.word2idx[UNK_TOKEN]) for token in tokens]
+    src_tensor = torch.tensor(src_indices, dtype=torch.long).unsqueeze(0).to(DEVICE)
+    
+    # 初始化目标序列（仅包含SOS_TOKEN）
+    tgt_indices = [tgt_vocab.word2idx[SOS_TOKEN]]
+    tgt_tensor = torch.tensor(tgt_indices, dtype=torch.long).unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        for _ in range(max_len):
+            # 前向传播
+            output = model(src_tensor, tgt_tensor)
+            
+            # 取最后一个token的预测
+            next_token_logits = output[:, -1, :]
+            next_token_idx = torch.argmax(next_token_logits, dim=-1).item()
+            
+            # 添加到目标序列
+            tgt_indices.append(next_token_idx)
+            
+            # 更新目标张量
+            tgt_tensor = torch.tensor(tgt_indices, dtype=torch.long).unsqueeze(0).to(DEVICE)
+            
+            # 如果预测到EOS_TOKEN，停止
+            if next_token_idx == tgt_vocab.word2idx[EOS_TOKEN]:
+                break
+    
+    # 转换为单词
+    translated_words = [tgt_vocab.idx2word[idx] for idx in tgt_indices if idx not in 
+                        [tgt_vocab.word2idx[SOS_TOKEN], tgt_vocab.word2idx[EOS_TOKEN], 
+                         tgt_vocab.word2idx[PAD_TOKEN]]]
+    
+    return ' '.join(translated_words)
+
+# 开始训练
+print("\n开始训练...")
+best_val_loss = float('inf')
+
+for epoch in range(EPOCHS):
+    # 训练
+    train_loss = train_epoch(model, train_loader, optimizer, criterion)
+    
+    # 验证
+    val_loss = evaluate(model, val_loader, criterion)
+    
+    print(f"\nEpoch {epoch+1}/{EPOCHS}")
+    print(f"训练损失: {train_loss:.4f}")
+    print(f"验证损失: {val_loss:.4f}")
+    
+    # 保存最佳模型
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), "transformer_eng2de_best.pth")
+        print("保存最佳模型！")
+
+# 测试
+print("\n开始测试...")
+test_loss = evaluate(model, test_loader, criterion)
+print(f"测试损失: {test_loss:.4f}")
+
+# 示例翻译
+print("\n示例翻译：")
+test_sentences = [
+    "A man is riding a horse.",
+    "Two dogs are playing in the park.",
+    "I love you."
+]
+
+for sentence in test_sentences:
+    translation = translate_sentence(model, sentence, src_vocab, tgt_vocab)
+    print(f"英语: {sentence}")
+    print(f"德语: {translation}")
+    print("-" * 50)
+```
