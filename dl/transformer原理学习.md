@@ -290,14 +290,14 @@ class PositionalEncoding(nn.Module):
     """位置编码：给序列添加位置信息"""
     def __init__(self, embedding_dim, max_len=MAX_SEQ_LEN):
         super().__init__()
-        # 计算位置编码
-        pe = torch.zeros(max_len, embedding_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # 计算位置编码 
+        pe = torch.zeros(max_len, embedding_dim) # [max_len, embedding_dim]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [max_len, 1]
         div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-np.log(10000.0) / embedding_dim))
         
         pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维度用sin
         pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维度用cos
-        pe = pe.unsqueeze(0)  # [1, max_len, embedding_dim]
+        pe = pe.unsqueeze(0)  # [1, max_len, embedding_dim] -> [1, 50, 256]
         self.register_buffer('pe', pe)  # 不参与训练的参数
     
     def forward(self, x):
@@ -336,16 +336,18 @@ class MultiHeadAttention(nn.Module):
         batch_size = q.size(0)
         
         # 投影到多个头
-        Q = self.q_linear(q)  # [batch_size, q_len, embedding_dim]
-        K = self.k_linear(k)  # [batch_size, k_len, embedding_dim]
-        V = self.v_linear(v)  # [batch_size, v_len, embedding_dim]
+        Q = self.q_linear(q)  # [batch_size, q_len, embedding_dim] → [32, seq_len, 256]
+        K = self.k_linear(k)  # [batch_size, k_len, embedding_dim] → [32, seq_len, 256]
+        V = self.v_linear(v)  # [batch_size, v_len, embedding_dim] → [32, seq_len, 256]
         
         # 拆分多头：[batch_size, num_heads, seq_len, head_dim]
+        # [32, seq_len, 256] → view → [32, seq_len, 4, 64] → permute → [32, 4, seq_len, 64]
         Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         K = K.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         V = V.view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
         # 计算注意力分数：Q @ K^T / scale
+        # Q @ K^T: [32, 4, seq_len, 64] @ [32, 4, 64, seq_len] = [32, 4, seq_len, seq_len]
         attention_scores = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.scale  # [batch_size, num_heads, q_len, k_len]
         
         # 应用mask（填充mask或未来mask）
@@ -353,17 +355,18 @@ class MultiHeadAttention(nn.Module):
             attention_scores = attention_scores.masked_fill(mask == 0, -1e10)
         
         # 计算注意力权重
-        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_weights = F.softmax(attention_scores, dim=-1) # [32, 4, seq_len, seq_len]
         
         # 加权求和
-        output = torch.matmul(attention_weights, V)  # [batch_size, num_heads, q_len, head_dim]
+        # [32, 4, seq_len, seq_len] @ [32, 4, seq_len, 64] = [32, 4, seq_len, 64]
+        output = torch.matmul(attention_weights, V)
         
         # 拼接多头
-        output = output.permute(0, 2, 1, 3).contiguous()  # [batch_size, q_len, num_heads, head_dim]
-        output = output.view(batch_size, -1, self.embedding_dim)  # [batch_size, q_len, embedding_dim]
+        output = output.permute(0, 2, 1, 3).contiguous()  # [32, seq_len, 4, 64]
+        output = output.view(batch_size, -1, self.embedding_dim)   # [32, seq_len, 4, 64] → [32, seq_len, 256]
         
         # 输出投影
-        output = self.out_linear(output)
+        output = self.out_linear(output) # [32, seq_len, 256] → [32, seq_len, 256]
         
         return output, attention_weights
 
@@ -446,16 +449,24 @@ class DecoderLayer(nn.Module):
 
 class Transformer(nn.Module):
     """完整的Transformer模型"""
+    """ src_vocab_size:10218, 
+        tgt_vocab_size:18679, 
+        embedding_dim:256, 
+        num_heads:4, 
+        ffn_hidden_dim:512, 
+        num_encoder_layers:2, 
+        num_decoder_layers:2
+        """
     def __init__(self, src_vocab_size, tgt_vocab_size, embedding_dim, num_heads, 
-                 ffn_hidden_dim, num_encoder_layers, num_decoder_layers):
+                 ffn_hidden_dim, num_encoder_layers, num_decoder_layers): 
         super().__init__()
         
         # 嵌入层
-        self.src_embedding = nn.Embedding(src_vocab_size, embedding_dim)
-        self.tgt_embedding = nn.Embedding(tgt_vocab_size, embedding_dim)
+        self.src_embedding = nn.Embedding(src_vocab_size, embedding_dim) # [src_vocab_size, 256] -> [10218, 256]
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, embedding_dim) # [dst_vocab_size, 256] -> [18679, 256]
         
         # 位置编码
-        self.positional_encoding = PositionalEncoding(embedding_dim)
+        self.positional_encoding = PositionalEncoding(embedding_dim) # [1, 50, 256]
         
         # 编码器
         self.encoder_layers = nn.ModuleList([
@@ -559,11 +570,22 @@ def train_epoch(model, loader, optimizer, criterion):
         
         # 输入：tgt_batch[:, :-1]（去掉最后一个token）
         # 目标：tgt_batch[:, 1:]（去掉第一个token）
-        output = model(src_batch, tgt_batch[:, :-1])
+        #   为什么要错开一位？
+
+        #   Decoder 输入 ([:-1]):  <SOS>   ich   liebe  dich
+        #                             ↓      ↓      ↓      ↓
+        #   预测目标 ([1:]):       ich    liebe  dich   <EOS>
+
+        #   输入和目标正好错开一位——这就是 "shift right" 的本质：
+
+        #   - 输入第 0 个词 <SOS>，模型应该输出第 1 个词 ich
+        #   - 输入第 1 个词 ich（已知道），模型应该输出第 2 个词 liebe
+        #   - 以此类推...
+        output = model(src_batch, tgt_batch[:, :-1])    # 维度说明：src_batch: [32, 50], tgt_batch[:, :-1]: [32, 49]， output: [batch_size, tgt_len-1, tgt_vocab_size]  → [32, 49, vocab_size] 
         
         # 调整形状计算损失
-        output = output.reshape(-1, output.shape[-1])
-        target = tgt_batch[:, 1:].reshape(-1)
+        output = output.reshape(-1, output.shape[-1])   # [32*49, vocab_size]
+        target = tgt_batch[:, 1:].reshape(-1)           # [32*49]
         
         # 计算损失
         loss = criterion(output, target)
