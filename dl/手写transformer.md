@@ -1,3 +1,6 @@
+# transfomer网络结果实现（手写）
+
+```
 import torch
 import torch.nn as nn
 import math
@@ -286,3 +289,228 @@ if __name__ == "__main__":
     # combine_mask = generate_decoder_self_mask(test_seq)
     # print("Padding 掩码形状:", combine_mask.shape)
     # print("Padding 掩码:\n", combine_mask)
+```
+
+
+
+# train_multi30k 网络结果实现（手写）
+```
+import json
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from collections import Counter
+from my_transformer import (
+    Transformer,
+    generate_padding_mask,
+    generate_decoder_self_mask,
+)
+
+# ── 特殊 token ──────────────────────────────────────────
+PAD_ID = 0
+SOS_ID = 1
+EOS_ID = 2
+UNK_ID = 3
+
+
+# ── 词表 ────────────────────────────────────────────────
+class Vocabulary:
+    def __init__(self):
+        self.word2idx = {"<pad>": PAD_ID, "<sos>": SOS_ID, "<eos>": EOS_ID, "<unk>": UNK_ID}
+        self.idx2word = {v: k for k, v in self.word2idx.items()}
+        self.counter = Counter()
+
+    def add_sentence(self, sentence):
+        for word in sentence.lower().split():
+            self.counter[word] += 1
+
+    def build(self, min_freq=2):
+        for word, freq in sorted(self.counter.items()):
+            if freq >= min_freq:
+                idx = len(self.word2idx)
+                self.word2idx[word] = idx
+                self.idx2word[idx] = word
+
+    def encode(self, sentence):
+        return [SOS_ID, *(self.word2idx.get(w, UNK_ID) for w in sentence.lower().split()), EOS_ID]
+
+    def decode(self, ids):
+        tokens = []
+        for i in ids:
+            if i in (PAD_ID, SOS_ID):
+                continue
+            if i == EOS_ID:
+                break
+            tokens.append(self.idx2word.get(i, "<unk>"))
+        return " ".join(tokens)
+
+    def __len__(self):
+        return len(self.word2idx)
+
+
+# ── 数据集 ──────────────────────────────────────────────
+class TranslationDataset(Dataset):
+    def __init__(self, filepath, src_vocab, tgt_vocab):
+        self.pairs = []
+        with open(filepath) as f:
+            for line in f:
+                d = json.loads(line)
+                self.pairs.append((src_vocab.encode(d["en"]), tgt_vocab.encode(d["de"])))
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.pairs[idx][0]), torch.tensor(self.pairs[idx][1])
+
+
+def collate_fn(batch):
+    srcs, tgts = zip(*batch)
+    srcs = pad_sequence(srcs, batch_first=True, padding_value=PAD_ID)
+    tgts = pad_sequence(tgts, batch_first=True, padding_value=PAD_ID)
+    return srcs, tgts[:, :-1], tgts[:, 1:]
+
+
+# ── 训练 / 验证 ────────────────────────────────────────
+def train_epoch(model, dataloader, optimizer, criterion, scheduler, device):
+    model.train()
+    total_loss = 0
+    for src, tgt_input, tgt_output in dataloader:
+        src, tgt_input, tgt_output = src.to(device), tgt_input.to(device), tgt_output.to(device)
+
+        src_mask = generate_padding_mask(src).to(device)
+        tgt_mask = generate_decoder_self_mask(tgt_input).to(device)
+
+        logits = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+@torch.no_grad()
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    for src, tgt_input, tgt_output in dataloader:
+        src, tgt_input, tgt_output = src.to(device), tgt_input.to(device), tgt_output.to(device)
+
+        src_mask = generate_padding_mask(src).to(device)
+        tgt_mask = generate_decoder_self_mask(tgt_input).to(device)
+
+        logits = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+# ── 贪心翻译 ────────────────────────────────────────────
+@torch.no_grad()
+def translate(model, sentence, src_vocab, tgt_vocab, device, max_len=50):
+    model.eval()
+    src_ids = torch.tensor([src_vocab.encode(sentence)], device=device)
+    src_mask = generate_padding_mask(src_ids).to(device)
+    output_ids = model.generate(src_ids, src_mask, SOS_ID, EOS_ID, max_len)
+    return tgt_vocab.decode(output_ids[0].tolist())
+
+
+# ── 词表构建工具 ────────────────────────────────────────
+def build_vocabularies(data_dir, min_freq):
+    en_vocab, de_vocab = Vocabulary(), Vocabulary()
+    with open(f"{data_dir}/train.jsonl") as f:
+        for line in f:
+            d = json.loads(line)
+            en_vocab.add_sentence(d["en"])
+            de_vocab.add_sentence(d["de"])
+    en_vocab.build(min_freq)
+    de_vocab.build(min_freq)
+    return en_vocab, de_vocab
+
+
+# ── 主流程 ──────────────────────────────────────────────
+if __name__ == "__main__":
+    # 超参数（适配 Multi30k 小数据集）
+    dim = 256
+    heads = 4
+    enc_layers = 4
+    dec_layers = 4
+    dropout = 0.1
+    batch_size = 128
+    lr = 5e-4
+    epochs = 30
+    warmup_steps = 2000
+    max_len = 50
+    min_freq = 2
+    data_dir = "data/Multi30k"
+    save_path = "transformer_en_de.pt"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 词表
+    print("Building vocabularies...")
+    en_vocab, de_vocab = build_vocabularies(data_dir, min_freq)
+    print(f"EN vocab size: {len(en_vocab)}, DE vocab size: {len(de_vocab)}")
+
+    # 数据
+    train_dl = DataLoader(
+        TranslationDataset(f"{data_dir}/train.jsonl", en_vocab, de_vocab),
+        batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
+    )
+    val_dl = DataLoader(
+        TranslationDataset(f"{data_dir}/val.jsonl", en_vocab, de_vocab),
+        batch_size=batch_size, collate_fn=collate_fn,
+    )
+
+    # 模型
+    model = Transformer(
+        src_vocab_size=len(en_vocab), tgt_vocab_size=len(de_vocab),
+        dim=dim, heads=heads, enc_layers=enc_layers, dec_layers=dec_layers,
+        dropout=dropout, max_len=max_len,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=0.1)
+
+    # Warmup + Noam 学习率调度（原论文方案）
+    def noam_lr(step):
+        step = max(step, 1)
+        return min(step ** -0.5, step * warmup_steps ** -1.5) * (dim ** 0.5)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=noam_lr)
+
+    # 训练
+    print(f"Training on {device}...")
+    best_val_loss = float("inf")
+    for epoch in range(1, epochs + 1):
+        train_loss = train_epoch(model, train_dl, optimizer, criterion, scheduler, device)
+        val_loss = evaluate(model, val_dl, criterion, device)
+        cur_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch:02d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {cur_lr:.2e}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({"model": model.state_dict(), "en_vocab": en_vocab.word2idx, "de_vocab": de_vocab.word2idx}, save_path)
+            print(f"  -> Saved best model (val_loss={val_loss:.4f})")
+
+    # 翻译测试
+    print("\nLoading best model for translation...")
+    ckpt = torch.load(save_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+
+    test_sentences = [
+        "A man is standing in the rain.",
+        "Two dogs are playing in the grass.",
+        "A woman is reading a book on the bench.",
+        "Three children are running in the park.",
+        "A cat is sitting on a chair.",
+    ]
+    print("\n--- Translation Results ---")
+    for sent in test_sentences:
+        result = translate(model, sent, en_vocab, de_vocab, device)
+        print(f"EN: {sent}\nDE: {result}\n")
+
+```
